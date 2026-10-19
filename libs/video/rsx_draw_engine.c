@@ -1154,6 +1154,40 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
     return g.be->surface_view(g.be->user, z->conv, t->remap & 0xFFFFu, t->format);
 }
 
+int rsx_draw_engine_depth_blit(u32 src_offset, u32 src_pitch, u32 dst_offset, u32 dst_pitch,
+                               u32 u0, u32 v0, u32 ds_dx, u32 dt_dy,
+                               u32 dx, u32 dy, u32 w, u32 h)
+{
+    if (!g.ready || !g.be->depth_blit || !w || !h) return 0;
+    u32 src = ENG_INVALID;
+    for (u32 i = 0; i < g.n_zdepths; i++)
+        if (g.zdepths[i].handle && g.zdepths[i].location == RSX_LOCATION_LOCAL &&
+            g.zdepths[i].offset == src_offset) { src = i; break; }
+    if (src == ENG_INVALID) return 0;
+    /* Z24S8 only, read with the pitch it was rendered at. */
+    if (g.zdepths[src].zfmt == 1u || (g.zdepths[src].pitch && g.zdepths[src].pitch != src_pitch))
+        return 0;
+    const u32 sx1 = (u32)((((u64)u0 << 8) + (u64)(2u * w - 1u) * ds_dx / 2u) >> 20);
+    const u32 sy1 = (u32)((((u64)v0 << 8) + (u64)(2u * h - 1u) * dt_dy / 2u) >> 20);
+    if (sx1 >= g.zdepths[src].w || sy1 >= g.zdepths[src].h) return 0;
+    const u32 dst = eng_zdepth_get(RSX_LOCATION_LOCAL, dst_offset, dx + w, dy + h);
+    if (dst == ENG_INVALID || dst == src) return 0;
+    if (!g.be->depth_blit(g.be->user, g.zdepths[src].handle, u0, v0, ds_dx, dt_dy,
+                          g.zdepths[dst].handle, dx, dy, w, h))
+        return 0;
+    eng_zdepth* z = &g.zdepths[dst];
+    z->cleared = 1;
+    z->had_write = 1;
+    z->snapshot_valid = 0;
+    z->depth_serial = ++g.write_serial;
+    z->guest_dirty = 1;
+    z->zfmt = g.zdepths[src].zfmt;
+    z->pitch = dst_pitch;
+    z->used_w = dx + w;
+    z->used_h = dy + h;
+    return 1;
+}
+
 /* ---- textures ------------------------------------------------------------ */
 
 static rsx_be_format eng_texfmt(rsx_texfmt f)
@@ -2933,6 +2967,14 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
             memcpy(&fb, &b, sizeof fb);
             fprintf(s_pd.draws_log, " po %g/%g", ff, fb);
         }
+        /* Depth func, cull and stencil (front / back when two-sided), plus
+         * the stencil reference -- for passes that count shadow volumes. */
+        fprintf(s_pd.draws_log, " df %X cull %u %X ff %X st %u ts %u f %X/%02X/%02X ops %X %X %X"
+                " b %X ops %X %X %X ref %02X |", rs->depth_func, rs->cull_enable, rs->cull_face,
+                rs->front_face, rs->stencil_enable, rs->stencil_two_sided, rs->s_func,
+                rs->s_func_mask, rs->s_write_mask, rs->s_fail, rs->s_zfail, rs->s_zpass,
+                rs->bs_func, rs->bs_fail, rs->bs_zfail, rs->bs_zpass,
+                rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
         for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
             if (!(tex_mask & (1u << u))) continue;
             rsx_dsp_texture t;
@@ -2982,6 +3024,26 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
             t.format & 0xFFu, t.width, t.height, t.pitch, t.cubemap ? " cube" : "",
             t.remap & 0xFFFFu, t.wrap >> 28, src);
     }
+}
+
+/* Re-arm the pass dump at run time (a capture key): capture from the next
+ * presented frame into `dir` (must exist) for up to `max_passes` passes.
+ * Ignored while a capture is already running. */
+void rsx_draw_engine_pass_dump_arm(const char* dir, u32 max_passes)
+{
+    static char s_dir[512];
+    if (!dir || !*dir || s_pd.state == 2) return;
+    snprintf(s_dir, sizeof s_dir, "%s", dir);
+    if (s_pd.index) { fclose(s_pd.index); s_pd.index = NULL; }
+    if (s_pd.draws_log) { fclose(s_pd.draws_log); s_pd.draws_log = NULL; }
+    s_pd.dir = s_dir;
+    s_pd.min_draws = 1;
+    s_pd.after_s = 0;
+    s_pd.max_passes = max_passes ? max_passes : 48u;
+    s_pd.start = time(NULL);
+    s_pd.pass = 0;
+    s_pd.open = 0;
+    s_pd.state = 1;
 }
 
 /* Called on every present: arm on the first frame heavy enough when no delay
@@ -3321,6 +3383,11 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         pd_note(targets, n_targets,
                 eng_zdepth_get(zs.zeta_location, zs.zeta_offset, zs.clip_w, zs.clip_h),
                 NULL, 0, 0);
+        if (s_pd.draws_log)
+            fprintf(s_pd.draws_log, "pass %03u clear after %u draws: mask %X color %08X zstencil %08X"
+                    " zfmt %u zeta 0x%08X\n", s_pd.pass, s_pd.draws, mask,
+                    rsx_dsp_clear_color(&g.rsx), rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR),
+                    zs.depth_format, zs.zeta_offset);
     }
 
     rsx_dsp_surface sf;

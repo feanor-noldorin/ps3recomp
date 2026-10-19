@@ -142,6 +142,10 @@ static int gcm_flip_executed_take(void)
     if (s_flip_direct_pending) { s_flip_direct_pending = 0; return 1; }
     return 0;
 }
+/* GCM_PREPAREFLIP_QUEUE: a prepared flip's place in the command stream (see
+ * cellGcmSetPrepareFlip). The walker holds at it while an earlier prepared
+ * flip has not been flipped yet. */
+#define GCM_PREPARE_MARKER 0xFEAD0200u
 /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
  * derive it from the observed per-frame volume if a title outgrows it. */
 #define GCM_FLIP_WRAP_BYTES 0x40000u
@@ -279,6 +283,26 @@ static int gcm_prepareflip_queue(void)
     return v;
 }
 static volatile u32 s_prepared_flips = 0;   /* bit n: buffer n queued */
+/* Prepare markers the walker has passed, and queued flips executed. The
+ * walker passes a marker only while every earlier one has been flipped. */
+static volatile long s_prep_passed = 0, s_prep_flipped = 0;
+static u64 s_prep_hold_since = 0;   /* when the current hold began, 0 = none */
+
+/* GCM_FLIP_TRACE=1: one line per flip-pipeline event, ms since the first --
+ * P prepare (queued id), I immediate flip of a queued id, C a tick completing
+ * a requested flip, H the guest flip handler delivered, V the guest vblank
+ * handler delivered. Shows where a frame waits between being queued and
+ * being counted done. Capped at 20000 lines. */
+static void gcm_flip_trace(char ev, u32 v)
+{
+    static int on = -1; static u64 t0; static unsigned n;
+    if (on < 0) on = getenv("GCM_FLIP_TRACE") ? 1 : 0;
+    if (!on || n >= 20000u) return;
+    const u64 now = get_timestamp_ns();
+    if (!t0) t0 = now;
+    n++;
+    fprintf(stderr, "[ftr] %c %.2f %u\n", ev, (double)(now - t0) / 1e6, v);
+}
 
 static u32 s_vblank_handler_opd   = 0;
 static u32 s_user_handler_opd     = 0;
@@ -919,6 +943,7 @@ void ppu_gcm_pump(void)
                            calls, nv, nf, s_vblank_count, 10); } }
     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
+        gcm_flip_trace('V', s_vblank_count);
         g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
                            0, 0, 0, 0, 0, 0, 0);
     }
@@ -938,6 +963,7 @@ void ppu_gcm_pump(void)
         long n = gcm_flipcb_on_tick_only() ? GCM_FLIPS_OWED_TAKE() : 1;
         for (; n > 0 && s_flip_handler_opd && g_ps3_guest_caller; n--) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
+            gcm_flip_trace('H', 0);
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
         }
     }
@@ -973,6 +999,7 @@ void cellGcmTickFlip(void)
         if (gcm_flip_complete_one()) {
             FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; FLIP_UNLOCK();
             GCM_PENDING_SET(2);
+            gcm_flip_trace('C', 0);
         }
         return;
     }
@@ -1220,6 +1247,28 @@ static void nv3089_blit(void)
                      cellGcmResolveLocated(_dl, s_gcm2d.dst_offset), dst_pitch,
                      s_nv309e.active, 10);
           }
+      } }
+    /* On by default; RSX_ENGINE_DEPTH_BLIT=0 turns it off. A blit whose source is a zeta the draw engine
+     * renders (ICO halves its scene depth+stencil into a second zeta, 32-bit
+     * pixels, ds = dt = 2.0, for its stencil shadow volumes). The depth lives
+     * only on the host GPU, so the memory copy below moves nothing and the
+     * shadow pass tested against an empty depth buffer -- the light band.
+     * Copy depth and stencil between the engine's depth targets instead. */
+    { static int db = -1;
+      if (db < 0) { const char* e = getenv("RSX_ENGINE_DEPTH_BLIT"); db = e ? atoi(e) : 1; }
+      if (db && rsx_draw_engine_enabled() &&
+          s_nv3089.src_dma != 0xFEED0001u && s_gcm2d.dst_dma != 0xFEED0001u &&
+          (s_nv3089.fmt & 0xFFu) != 7u && (s_nv3089.fmt & 0xFFu) != 8u &&
+          s_gcm2d.color_fmt != 4u && s_gcm2d.color_fmt != 1u) {
+          const int done = rsx_draw_engine_depth_blit(s_nv3089.in_off, in_pitch,
+                                                      s_gcm2d.dst_offset, dst_pitch,
+                                                      s_nv3089.in_uv & 0xFFFFu, s_nv3089.in_uv >> 16,
+                                                      s_nv3089.ds_dx, s_nv3089.dt_dy,
+                                                      out_x, out_y, out_w, out_h);
+          { static int n = 0;
+            if (done && n < 4) { n++; fprintf(stderr, "[NV3089] engine depth blit %ux%u 0x%X -> 0x%X\n",
+                                              out_w, out_h, s_nv3089.in_off, s_gcm2d.dst_offset); } }
+          if (done) return;
       } }
 #ifdef _WIN32
     /* GCM_NV3089_GPU_COPY=1 (draw engine): a surface bounced through main
@@ -2465,6 +2514,32 @@ static void gcm_rsx_process_fifo_unlocked(void)
                          (w & 0xE0000003u) != 0x20000000u || (w & 0x1FFFFFFCu) != park_off))
             park_off = 0;
 
+        if ((w & 0xFFFFFF00u) == GCM_PREPARE_MARKER) {
+            /* A prepared flip (cellGcmSetPrepareFlip). The hardware flip
+             * queue makes the RSX wait here while the previous prepared flip
+             * has not been shown, so the label the title writes right after
+             * never runs a frame ahead of the display. Without the wait two
+             * frames could land between vblanks, the title flipped only the
+             * newer, and the older was never counted done -- ICO then waited
+             * on its frames-in-flight limit forever. Hold here; the next
+             * drain tries again. */
+            if (s_prep_passed - s_prep_flipped >= 1) {
+                static int said = 0;
+                const u64 now = get_timestamp_ns();
+                if (!s_prep_hold_since) s_prep_hold_since = now;
+                if (!said && now - s_prep_hold_since > 1000000000ull) {
+                    said = 1;
+                    fprintf(stderr, "[cellGcmSys] prepare marker held >1 s (passed=%ld flipped=%ld)%c",
+                            (long)s_prep_passed, (long)s_prep_flipped, 10);
+                }
+                why = "prepare-wait";
+                break;
+            }
+            __atomic_add_fetch(&s_prep_passed, 1, __ATOMIC_SEQ_CST);
+            s_prep_hold_since = 0;
+            s_fifo_getoff += 4;
+            continue;
+        }
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
             /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
              * this word into the FIFO instead of calling any import. Fire the
@@ -2944,20 +3019,28 @@ static void gcm_rsx_process_fifo_unlocked(void)
     /* A drain stopped on a semaphore acquire (GCM_SEMA_ACQUIRE) holds `get`
      * on purpose: that is the wait, not a stuck walker, and the acquire's own
      * bound (GCM_SEMA_ACQUIRE_MS) is what ends it. So is a self-JUMP park,
-     * which GCM_PARK_GRACE_MS ends. This counter counts drain passes, not
+     * which GCM_PARK_GRACE_MS ends, and a hold at a prepare marker, which
+     * waits for a flip. This counter counts drain passes, not
      * time: both stop every pass at the same `get`, so it fired a few
      * milliseconds in and resynced to put. For a park that is before the
      * title has patched it into a JUMP to the commands it just wrote at the
      * ring start, and the resync dropped them: inFAMOUS 2 stopped presenting
      * for good that way in about one New Marais run in five ("stuck-get" at a
-     * self-jump with no "jump-park" before it). */
-    { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
-      if (s_sema_blocked_pass || s_park_pass) {
-          stuck = 0; last = s_fifo_getoff; s_sema_blocked_pass = 0; s_park_pass = 0; }
+     * self-jump with no "jump-park" before it). The walker must also stand
+     * still for TIME, not only for a number of passes: once frames stopped
+     * waiting on the GPU the drain loop ran several times faster, eight
+     * passes went by inside one legitimate wait during ICO's scene load, and
+     * the resync dropped 150 KB of commands. */
+    { static u32 last = 0xFFFFFFFFu; static int stuck = 0; static u64 since = 0;
+      const u64 now_ns = get_timestamp_ns();
+      if (s_sema_blocked_pass || s_park_pass || s_prep_hold_since) {
+          stuck = 0; since = 0; last = s_fifo_getoff; s_sema_blocked_pass = 0; s_park_pass = 0; }
       else if (s_fifo_getoff == last && s_fifo_getoff != put) {
-          if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
-                             gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
-      } else { stuck = 0; last = s_fifo_getoff; } }
+          if (!since) since = now_ns;
+          if (++stuck >= 8 && now_ns - since >= 2000000000ull) {
+              gcm_fifo_dump_around(s_fifo_getoff);
+              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; since = 0; }
+      } else { stuck = 0; since = 0; last = s_fifo_getoff; } }
 
     /* Publish progress: get chases put; ref advances at most ONE queued fence
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
@@ -3358,7 +3441,7 @@ s32 cellGcmSetFlipCommand(u32 bufferId) { return gcm_flip_request(bufferId, 0); 
  * at ctx->current instead; the drain stops at it and fires the flip there,
  * exactly as it does for the 0xFEAD words a statically-linked libgcm emits.
  * Returns 0 when there is no room or ctx is not a mapped command buffer. */
-static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+static int gcm_flip_into_fifo(u32 ctx, u32 bufferId, u32 marker)
 {
     if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
         !s_display_buffer_set[bufferId]) return 0;
@@ -3366,8 +3449,8 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
     /* Never near the end: those bytes are the title's reserve before its
      * ring wraps, and the recycle above keys on them. */
     if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
-    vm_write32(cur, GCM_FLIP_MARKER | bufferId);
-    s_fifo_flips_queued++;
+    vm_write32(cur, marker | bufferId);
+    if (marker == GCM_FLIP_MARKER) s_fifo_flips_queued++;
     /* Wrap here, on the guest thread, once the ring is nearly used -- what the
      * SDK's buffer-full callback does. Otherwise the drain thread recycles it
      * (see "recycled the title's own ring"), rewriting ctx->current and put
@@ -3441,6 +3524,8 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 #else
         __atomic_fetch_or(&s_prepared_flips, 1u << bufferId, __ATOMIC_SEQ_CST);
 #endif
+        gcm_flip_trace('P', bufferId);
+        gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId, GCM_PREPARE_MARKER);
         return (s32)bufferId;
     }
 
@@ -4209,7 +4294,7 @@ s32 cellGcmSetDefaultFifoSize(u32 size)
 /* NID: 0x21397818 */
 s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
-    if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
+    if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId, GCM_FLIP_MARKER))
         return gcm_flip_request(bufferId, 1);
     return cellGcmSetFlipCommand(bufferId);
 }
@@ -4236,7 +4321,7 @@ s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId,
             vm_write32(cur + 8,  0x00040068u);   /* SEMAPHORE_ACQUIRE */
             vm_write32(cur + 12, labelValue);
             vm_write32(c + 8, cur + 16);
-            if (gcm_flip_into_fifo(c, bufferId))
+            if (gcm_flip_into_fifo(c, bufferId, GCM_FLIP_MARKER))
                 return gcm_flip_request(bufferId, 1);
             vm_write32(c + 8, cur);              /* no room for the flip */
         }
@@ -4479,7 +4564,22 @@ s32 cellGcmSetFlipImmediate(u32 bufferId)
 #else
         const u32 was = __atomic_fetch_and(&s_prepared_flips, ~bit, __ATOMIC_SEQ_CST);
 #endif
-        if (was & bit) return gcm_flip_request_ex(bufferId, 0, 1);
+        if (was & bit) {
+            gcm_flip_trace('I', bufferId);
+            if (s_prep_flipped < s_prep_passed) __atomic_add_fetch(&s_prep_flipped, 1, __ATOMIC_SEQ_CST);
+            const s32 rc = gcm_flip_request_ex(bufferId, 0, 1);
+            /* The flip happens at this vblank -- the title calls this from
+             * its vblank handler -- so complete it now instead of on the
+             * next tick. Waiting a tick made every frame cost two vblanks
+             * (ICO: the next frame starts only after the flip handler), so
+             * a title asking for one flip per vblank got 30. */
+            if (rc == CELL_OK && gcm_flip_complete_one()) {
+                s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+                GCM_PENDING_SET(2);
+                gcm_flip_trace('C', 1);
+            }
+            return rc;
+        }
     }
     return gcm_flip_request_ex(bufferId, 0, 0);
 }

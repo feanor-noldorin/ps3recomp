@@ -62,7 +62,16 @@ static double pad_clock(unsigned long long t0_ms)
 #endif
 
 #if PAD_BACKEND_SDL2
-  #include <SDL2/SDL.h>
+  #define SDL_MAIN_HANDLED   /* the title's main() stays its own */
+  #if defined(__has_include)
+    #if __has_include(<SDL2/SDL.h>)
+      #include <SDL2/SDL.h>
+    #else
+      #include <SDL.h>       /* the VC development package's include/ */
+    #endif
+  #else
+    #include <SDL2/SDL.h>
+  #endif
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -277,7 +286,10 @@ static int pad_host_window_focused(void)
     return pid == GetCurrentProcessId();
 }
 
-static void pad_poll_keyboard(void)
+/* merge = a controller already filled port 0 on this sweep: the keys are
+ * added to it (buttons OR'd, the left stick taken from the arrows only while
+ * one is held) instead of replacing it, so keyboard and pad work together. */
+static void pad_poll_keyboard(int merge)
 {
     static int off = -1;
     if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
@@ -285,6 +297,7 @@ static void pad_poll_keyboard(void)
 
     PadHostState* hs = &s_host_state[0];
     if (!pad_host_window_focused()) {
+        if (merge) return;   /* the controller's own state stands */
         /* Release everything on focus loss, or a key held while alt-tabbing
          * would stay down forever. */
         hs->buttons = 0;
@@ -307,6 +320,17 @@ static void pad_poll_keyboard(void)
     u16 btns = 0;
     for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
         if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
+
+    if (merge) {
+        hs->buttons |= btns;
+        if (btns & CELL_PAD_CTRL_LEFT)  hs->analog_lx = 0;
+        if (btns & CELL_PAD_CTRL_RIGHT) hs->analog_lx = 255;
+        if (btns & CELL_PAD_CTRL_UP)    hs->analog_ly = 0;
+        if (btns & CELL_PAD_CTRL_DOWN)  hs->analog_ly = 255;
+        if (btns & CELL_PAD_CTRL_L2)    hs->trigger_l2 = 255;
+        if (btns & CELL_PAD_CTRL_R2)    hs->trigger_r2 = 255;
+        return;
+    }
 
     hs->buttons   = btns;
     hs->connected = 1;
@@ -425,9 +449,45 @@ static void pad_shutdown_backend(void)
 
 #if PAD_BACKEND_SDL2
 
+/* PAD_SQUIRCLE[=<factor>]: push a stick's round range out toward a square.
+ *
+ * A DualShock 3 reports nearly full deflection on BOTH axes at a diagonal; a
+ * DualShock 4 / DualSense reports a circle, so a diagonal comes out at about
+ * 0.7 of full on each axis. A title that measures speed per axis then sees a
+ * half-pushed stick on every diagonal. This scales the radius by
+ * 1 + sin^2(2*angle) / (factor / 1000) -- no change on the axes, the most at
+ * 45 degrees -- and clamps to the 0..255 range. On by default with factor
+ * 8000 (ICO: a circle on a DualSense dropped the boy from a run to a walk
+ * on every diagonal; with this it holds the run); PAD_SQUIRCLE=0 turns it
+ * off, PAD_SQUIRCLE=<n> >= 100 sets the factor. */
+static void pad_squircle(u8* px, u8* py)
+{
+    static float k = -1.0f;
+    if (k < 0.0f) {
+        const char* e = getenv("PAD_SQUIRCLE");
+        int f = (e && *e) ? atoi(e) : 8000;
+        if (e && *e && f > 0 && f < 100) f = 8000;
+        k = f > 0 ? 1000.0f / (float)f : 0.0f;
+        if (k > 0.0f) printf("[cellPad] PAD_SQUIRCLE factor %d\n", f);
+    }
+    if (k == 0.0f) return;
+    const float x = ((float)*px - 128.0f) / 127.0f, y = ((float)*py - 128.0f) / 127.0f;
+    const float r = sqrtf(x * x + y * y);
+    if (r == 0.0f) return;
+    const float a = atan2f(y, x), s = sinf(2.0f * a);
+    const float rr = r * (1.0f + s * s * k);
+    int nx = (int)lrintf(128.0f + rr * cosf(a) * 127.0f);
+    int ny = (int)lrintf(128.0f + rr * sinf(a) * 127.0f);
+    *px = (u8)(nx < 0 ? 0 : nx > 255 ? 255 : nx);
+    *py = (u8)(ny < 0 ? 0 : ny > 255 ? 255 : ny);
+}
+
 static u8 pad_sdl_axis_to_u8(int raw)
 {
-    /* SDL axis: -32768..32767 -> 0..255 with center at 128 */
+    /* SDL axis: -32768..32767 -> 0..255 with center at 128. A resting stick
+     * drifts a few counts either way; snap that to exactly 128, since 127
+     * has been read as a deflection (see the XInput path's note on it). */
+    if (raw > -2500 && raw < 2500) return 128;
     int val = ((raw + 32768) * 255) / 65535;
     if (val < 0) val = 0;
     if (val > 255) val = 255;
@@ -608,6 +668,8 @@ static void pad_poll_sdl2(void)
         s_host_state[i].analog_ly = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY));
         s_host_state[i].analog_rx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX));
         s_host_state[i].analog_ry = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY));
+        pad_squircle(&s_host_state[i].analog_lx, &s_host_state[i].analog_ly);
+        pad_squircle(&s_host_state[i].analog_rx, &s_host_state[i].analog_ry);
 
         /* Triggers */
         s_host_state[i].trigger_l2 = pad_sdl_trigger_to_u8(lt);
@@ -711,7 +773,7 @@ static void pad_poll_backend(void)
     pad_poll_sdl2();
 #endif
 #ifdef _WIN32
-    if (!s_host_state[0].connected) pad_poll_keyboard();
+    pad_poll_keyboard(s_host_state[0].connected);
 #endif
     pad_track_assign();
     pad_unlock();

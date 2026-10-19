@@ -312,6 +312,13 @@ typedef struct rsx_draw_backend {
      * surface bounced through main memory (rsx_draw_engine_shadow_out/_in). */
     void (*copy_region)(void* user, u32 src_surface, u32 sx, u32 sy,
                         u32 dst_surface, u32 dx, u32 dy, u32 w, u32 h);
+    /* Optional: an NV3089 blit between two Z24S8 depth targets, depth and all
+     * eight stencil bits, ordered after the preceding work. Destination texel
+     * (dx + i, dy + j) takes source texel (u0 + (i + 0.5) * ds_dx,
+     * v0 + (j + 0.5) * dt_dy): u0/v0 in 12.4, the steps in 20.12 fixed point,
+     * as NV3089 programs them. Returns 1 when done. */
+    int  (*depth_blit)(void* user, u32 src_depth, u32 u0, u32 v0, u32 ds_dx, u32 dt_dy,
+                       u32 dst_depth, u32 dx, u32 dy, u32 w, u32 h);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -382,6 +389,15 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
  * caller may skip the guest-memory one, 0 to fall back. Needs copy_region. */
 int  rsx_draw_engine_shadow_out(u32 src_offset, u32 src_pitch, u32 main_offset, u32 w, u32 h);
 int  rsx_draw_engine_shadow_in(u32 main_offset, u32 dst_offset, u32 dst_pitch, u32 w, u32 h);
+/* An NV3089 blit from one local zeta the engine renders into another (ICO's
+ * scene depth+stencil halved for its shadow-volume pass): done on the GPU,
+ * depth and stencil. Returns 1 when done, 0 to fall back to the memory copy. */
+int  rsx_draw_engine_depth_blit(u32 src_offset, u32 src_pitch, u32 dst_offset, u32 dst_pitch,
+                                u32 u0, u32 v0, u32 ds_dx, u32 dt_dy,
+                                u32 dx, u32 dy, u32 w, u32 h);
+/* Capture the render passes of the next frame(s) into `dir` (must exist),
+ * as RSX_ENGINE_PASS_DUMP does, up to `max_passes` (0 = 48). */
+void rsx_draw_engine_pass_dump_arm(const char* dir, u32 max_passes);
 
 /* --- test hooks ---------------------------------------------------------- */
 

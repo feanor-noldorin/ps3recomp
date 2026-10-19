@@ -65,6 +65,7 @@ typedef struct {
     u32                   remap, rsx_fmt;
     u32                   conv;      /* DE_DEPTH: depth_as_color target     */
     int                   dsrv;      /* DE_DEPTH: R24_UNORM_X8 SRV, -1 none  */
+    int                   ssrv;      /* DE_DEPTH: X24_G8_UINT stencil SRV    */
 } de_obj;
 
 typedef struct {
@@ -84,7 +85,12 @@ typedef struct { u64 key; u32 base; } de_samp_table;
 
 static struct {
     int                        up;
-    ID3D12CommandAllocator*    alloc;
+    ID3D12CommandAllocator*    alloc;          /* the current frame slot's */
+    ID3D12CommandAllocator*    allocs[2];      /* one per frame slot */
+    u32                        slot;           /* frame slot being recorded */
+    u64                        slot_fence[2];  /* fence of each slot's last frame */
+    u64                        ring_base, ring_end;   /* the slot's half of the upload ring */
+    u32                        srv_base, srv_end;     /* ...and of the shader-visible SRV ring */
     ID3D12GraphicsCommandList* list;
     int                        open;
     ID3D12Fence*               fence;
@@ -194,6 +200,7 @@ static ID3D12GraphicsCommandList* de_cl(void)
     return s_de.list;
 }
 
+static long long s_de_wait_q, s_de_present_q;   /* QPC ticks: GPU-fence wait, Present call */
 static void de_submit(void)
 {
     if (!s_de.open) return;
@@ -203,14 +210,62 @@ static void de_submit(void)
     const u64 v = ++s_de.fence_value;
     s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_de.fence, v);
     if (s_de.fence->lpVtbl->GetCompletedValue(s_de.fence) < v) {
+        LARGE_INTEGER a, b; QueryPerformanceCounter(&a);
         s_de.fence->lpVtbl->SetEventOnCompletion(s_de.fence, v, s_de.event);
         WaitForSingleObject(s_de.event, 10000);
+        QueryPerformanceCounter(&b); s_de_wait_q += b.QuadPart - a.QuadPart;   /* D3D12ENG_LOG */
     }
     s_de.open = 0;
     s_de.n_submit++;
-    /* Nothing in flight any more: every ring may start over. */
-    s_de.ring_off = 0;
-    s_de.srv_gpu_next = 0;
+    /* Nothing in flight any more: the slot's rings may start over (and the
+     * other slot's frame is finished too). */
+    s_de.ring_off = s_de.ring_base;
+    s_de.srv_gpu_next = s_de.srv_base;
+}
+
+/* Frame slots. The rings are split in two halves and there are two command
+ * allocators, so the GPU can draw frame N out of one half while the CPU
+ * records frame N+1 into the other. */
+static void de_use_slot(u32 s)
+{
+    s_de.slot = s;
+    s_de.alloc = s_de.allocs[s];
+    s_de.ring_base = (u64)s * (DE_RING_BYTES / 2);  s_de.ring_end = s_de.ring_base + DE_RING_BYTES / 2;
+    s_de.srv_base  = s * (DE_SRV_GPU_COUNT / 2);    s_de.srv_end  = s_de.srv_base + DE_SRV_GPU_COUNT / 2;
+    s_de.ring_off = s_de.ring_base;
+    s_de.srv_gpu_next = s_de.srv_base;
+}
+
+/* End of frame: hand the frame to the GPU WITHOUT waiting for it, and move
+ * to the other slot -- waiting only if the GPU is still on the frame that
+ * slot held, i.e. the one before this. Every other submit (readbacks,
+ * releases, a full ring) keeps de_submit's full wait. */
+static void de_submit_frame(void)
+{
+    if (!s_de.open) return;
+    /* D3D12ENG_SYNC_SUBMIT=1: the old full wait at the end of every frame,
+     * to tell a rendering difference caused by the overlap from one that is
+     * not. */
+    { static int sync = -1;
+      if (sync < 0) { const char* e = getenv("D3D12ENG_SYNC_SUBMIT"); sync = (e && atoi(e) > 0) ? 1 : 0; }
+      if (sync) { de_submit(); return; } }
+    s_de.list->lpVtbl->Close(s_de.list);
+    ID3D12CommandList* l[1] = { (ID3D12CommandList*)s_de.list };
+    s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, l);
+    const u64 v = ++s_de.fence_value;
+    s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_de.fence, v);
+    s_de.slot_fence[s_de.slot] = v;
+    s_de.open = 0;
+    s_de.n_submit++;
+    const u32 next = s_de.slot ^ 1u;
+    const u64 need = s_de.slot_fence[next];
+    if (need && s_de.fence->lpVtbl->GetCompletedValue(s_de.fence) < need) {
+        LARGE_INTEGER a, b; QueryPerformanceCounter(&a);
+        s_de.fence->lpVtbl->SetEventOnCompletion(s_de.fence, need, s_de.event);
+        WaitForSingleObject(s_de.event, 10000);
+        QueryPerformanceCounter(&b); s_de_wait_q += b.QuadPart - a.QuadPart;
+    }
+    de_use_slot(next);
 }
 
 static void de_bind_heaps(void)
@@ -250,12 +305,12 @@ static void de_transition_raw(ID3D12Resource* r, D3D12_RESOURCE_STATES* cur, D3D
 /* `bytes` of ring space at `align`; NULL only when bytes exceed the ring. */
 static u8* de_ring(u64 bytes, u64 align, D3D12_GPU_VIRTUAL_ADDRESS* va, u64* off)
 {
-    if (bytes > DE_RING_BYTES) return NULL;
+    if (bytes > DE_RING_BYTES / 2) return NULL;
     u64 o = (s_de.ring_off + align - 1) & ~(align - 1);
-    if (o + bytes > DE_RING_BYTES) {
+    if (o + bytes > s_de.ring_end) {
         de_submit();
         s_de.n_ring_wrap++;
-        o = 0;
+        o = s_de.ring_off;
     }
     s_de.ring_off = o + bytes;
     if (va)  *va  = s_de.ring_va + o;
@@ -309,7 +364,7 @@ static u32 de_alloc_obj(void)
 {
     for (u32 i = 1; i < DE_MAX_OBJ; i++) if (s_de.obj[i].kind == DE_NONE) {
         memset(&s_de.obj[i], 0, sizeof(de_obj));
-        s_de.obj[i].rtv = s_de.obj[i].dsv = s_de.obj[i].srv = s_de.obj[i].dsrv = -1;
+        s_de.obj[i].rtv = s_de.obj[i].dsv = s_de.obj[i].srv = s_de.obj[i].dsrv = s_de.obj[i].ssrv = -1;
         return i;
     }
     return 0;
@@ -376,6 +431,7 @@ static void de_release_obj(u32 h)
             if (s_de.obj[i].kind == DE_VIEW && s_de.obj[i].parent == h) de_release_obj(i);
     if (o->kind == DE_DEPTH && o->conv) { const u32 c = o->conv; o->conv = 0; de_release_obj(c); }
     de_give(o->dsrv, s_de.srv_free, &s_de.n_srv_free);
+    de_give(o->ssrv, s_de.srv_free, &s_de.n_srv_free);
     if (o->res) o->res->lpVtbl->Release(o->res);
     de_give(o->rtv, s_de.rtv_free, &s_de.n_rtv_free);
     de_give(o->dsv, s_de.dsv_free, &s_de.n_dsv_free);
@@ -442,7 +498,10 @@ static int de_init(void* user, u32 width, u32 height)
     ID3D12Device* dev = s_d3d.device;
     if (!dev) return -1;
     if (FAILED(dev->lpVtbl->CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
-            &IID_ID3D12CommandAllocator, (void**)&s_de.alloc))) return -1;
+            &IID_ID3D12CommandAllocator, (void**)&s_de.allocs[0]))) return -1;
+    if (FAILED(dev->lpVtbl->CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            &IID_ID3D12CommandAllocator, (void**)&s_de.allocs[1]))) return -1;
+    de_use_slot(0);
     if (FAILED(dev->lpVtbl->CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_de.alloc, NULL,
             &IID_ID3D12GraphicsCommandList, (void**)&s_de.list))) return -1;
     s_de.list->lpVtbl->Close(s_de.list);
@@ -493,7 +552,8 @@ static void de_shutdown(void* user)
     if (s_de.readback) s_de.readback->lpVtbl->Release(s_de.readback);
     if (s_de.root)     s_de.root->lpVtbl->Release(s_de.root);
     if (s_de.list)     s_de.list->lpVtbl->Release(s_de.list);
-    if (s_de.alloc)    s_de.alloc->lpVtbl->Release(s_de.alloc);
+    for (int a = 0; a < 2; a++) if (s_de.allocs[a]) s_de.allocs[a]->lpVtbl->Release(s_de.allocs[a]);
+    s_de.alloc = NULL;
     if (s_de.fence)    s_de.fence->lpVtbl->Release(s_de.fence);
     if (s_de.event)    CloseHandle(s_de.event);
     memset(&s_de, 0, sizeof s_de);
@@ -725,7 +785,7 @@ static u32 de_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt)
     de_obj* c = de_get(out, DE_COLOR);
     if (!c) return 0;
     z = de_get(depth, DE_DEPTH);   /* the table does not move, but stay safe */
-    if (s_de.srv_gpu_next + DE_PS_UNITS > DE_SRV_GPU_COUNT) { de_submit(); s_de.n_ring_wrap++; }
+    if (s_de.srv_gpu_next + DE_PS_UNITS > s_de.srv_end) { de_submit(); s_de.n_ring_wrap++; }
     int srv[DE_PS_UNITS];
     de_obj* d2 = de_get(s_de.dummy2d, DE_TEXTURE);
     for (u32 i = 0; i < DE_PS_UNITS; i++) srv[i] = d2 ? d2->srv : -1;
@@ -748,6 +808,124 @@ static u32 de_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt)
     de_transition(z, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     s_de.n_depth_conv++;
     return out;
+}
+
+/* rsx_draw_backend.depth_blit: an NV3089 blit of one Z24S8 zeta into another,
+ * point-sampled (ICO halves its scene depth+stencil this way for the stencil
+ * shadow-volume pass). Full-screen triangles over the destination rectangle:
+ * one writes depth through SV_Depth and zeroes the stencil, then one per
+ * stencil bit sets that bit (REPLACE, write mask = the bit) where the source
+ * texel has it -- no SV_StencilRef needed. */
+static int de_depth_blit(void* user, u32 src_depth, u32 u0, u32 v0, u32 ds_dx, u32 dt_dy,
+                         u32 dst_depth, u32 dx, u32 dy, u32 w, u32 h)
+{
+    (void)user;
+    de_obj* s = de_get(src_depth, DE_DEPTH);
+    de_obj* d = de_get(dst_depth, DE_DEPTH);
+    if (!s || !d || s == d || !w || !h || dx + w > d->w || dy + h > d->h) return 0;
+    static ID3D12PipelineState* pso[9];   /* [0] depth, [1 + b] stencil bit b */
+    static int failed;
+    if (failed) return 0;
+    if (!pso[0]) {
+        static const char* vsrc =
+            "float4 main(uint id : SV_VertexID) : SV_Position {\n"
+            "  float2 p = float2((id << 1) & 2, id & 2);\n"
+            "  return float4(p * float2(2, -2) + float2(-1, 1), 0, 1); }\n";
+        /* a = (u0, v0, ds, dt) in source texels; b = (dx, dy, bit, 0). */
+        static const char* zsrc =
+            "cbuffer C : register(b1) { float4 a; float4 b; };\n"
+            "Texture2D<float> dz : register(t0);\n"
+            "float main(float4 pos : SV_Position) : SV_Depth {\n"
+            "  int2 p = int2(a.xy + (pos.xy - b.xy) * a.zw);\n"
+            "  return dz.Load(int3(p, 0)); }\n";
+        static const char* ssrc =
+            "cbuffer C : register(b1) { float4 a; float4 b; };\n"
+            "Texture2D<uint2> st : register(t1);\n"
+            "void main(float4 pos : SV_Position) {\n"
+            "  int2 p = int2(a.xy + (pos.xy - b.xy) * a.zw);\n"
+            "  if ((st.Load(int3(p, 0)).y & (uint)b.z) == 0) discard; }\n";
+        ID3DBlob* vs = de_compile(vsrc, "vs_5_0");
+        ID3DBlob* zps = de_compile(zsrc, "ps_5_0");
+        ID3DBlob* sps = de_compile(ssrc, "ps_5_0");
+        if (!vs || !zps || !sps) { failed = 1; return 0; }
+        for (u32 i = 0; i < 9; i++) {
+            ID3DBlob* ps = i ? sps : zps;
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+            pd.pRootSignature = s_de.root;
+            pd.VS.pShaderBytecode = vs->lpVtbl->GetBufferPointer(vs); pd.VS.BytecodeLength = vs->lpVtbl->GetBufferSize(vs);
+            pd.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps); pd.PS.BytecodeLength = ps->lpVtbl->GetBufferSize(ps);
+            pd.SampleMask = 0xFFFFFFFFu;
+            pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            pd.RasterizerState.DepthClipEnable = FALSE;
+            pd.DepthStencilState.DepthEnable    = i ? FALSE : TRUE;
+            pd.DepthStencilState.DepthWriteMask = i ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
+            pd.DepthStencilState.DepthFunc      = D3D12_COMPARISON_FUNC_ALWAYS;
+            pd.DepthStencilState.StencilEnable  = TRUE;
+            pd.DepthStencilState.StencilReadMask  = 0xFF;
+            pd.DepthStencilState.StencilWriteMask = i ? (UINT8)(1u << (i - 1)) : 0xFF;
+            D3D12_DEPTH_STENCILOP_DESC op = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                              D3D12_STENCIL_OP_REPLACE, D3D12_COMPARISON_FUNC_ALWAYS };
+            pd.DepthStencilState.FrontFace = op;
+            pd.DepthStencilState.BackFace  = op;
+            pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            pd.NumRenderTargets = 0; pd.SampleDesc.Count = 1;
+            if (FAILED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd, &IID_ID3D12PipelineState,
+                    (void**)&pso[i]))) {
+                fprintf(stderr, "[D3D12-ENG] depth_blit PSO %u failed\n", i);
+                failed = 1; return 0;
+            }
+        }
+    }
+    if (s->dsrv < 0 || s->ssrv < 0) {
+        for (int plane = 0; plane < 2; plane++) {
+            int* idx = plane ? &s->ssrv : &s->dsrv;
+            if (*idx >= 0) continue;
+            *idx = de_take(&s_de.srv_cpu_next, DE_SRV_CPU_COUNT, s_de.srv_free, &s_de.n_srv_free);
+            if (*idx < 0) return 0;
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
+            sd.Format = plane ? DXGI_FORMAT_X24_TYPELESS_G8_UINT : DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+            sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sd.Texture2D.MipLevels = 1;
+            sd.Texture2D.PlaneSlice = (UINT)plane;
+            s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s->res, &sd,
+                de_cpu(s_de.srv_cpu, s_de.srv_inc, (u32)*idx));
+        }
+    }
+    if (s_de.srv_gpu_next + DE_PS_UNITS > s_de.srv_end) { de_submit(); s_de.n_ring_wrap++; }
+    int srv[DE_PS_UNITS];
+    de_obj* d2 = de_get(s_de.dummy2d, DE_TEXTURE);
+    for (u32 i = 0; i < DE_PS_UNITS; i++) srv[i] = d2 ? d2->srv : -1;
+    srv[0] = s->dsrv; srv[1] = s->ssrv;
+    if (d2) de_transition(d2, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const D3D12_GPU_DESCRIPTOR_HANDLE table = de_srv_table(srv, DE_PS_UNITS);
+    de_transition(s, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    de_transition(d, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    ID3D12GraphicsCommandList* cl = de_cl();
+    const D3D12_CPU_DESCRIPTOR_HANDLE dh = de_cpu(s_de.dsv_heap, s_de.dsv_inc, (u32)d->dsv);
+    cl->lpVtbl->OMSetRenderTargets(cl, 0, NULL, FALSE, &dh);
+    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 2, table);
+    D3D12_VIEWPORT vp = { (float)dx, (float)dy, (float)w, (float)h, 0, 1 };
+    D3D12_RECT sc = { (LONG)dx, (LONG)dy, (LONG)(dx + w), (LONG)(dy + h) };
+    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
+    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
+    cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    for (u32 i = 0; i < 9; i++) {
+        D3D12_GPU_VIRTUAL_ADDRESS va;
+        float* c = (float*)de_ring(256, 256, &va, NULL);
+        if (!c) break;
+        c[0] = (float)u0 / 16.0f;  c[1] = (float)v0 / 16.0f;            /* 12.4 */
+        c[2] = (float)ds_dx / 1048576.0f; c[3] = (float)dt_dy / 1048576.0f;  /* 20.12 */
+        c[4] = (float)dx; c[5] = (float)dy; c[6] = i ? (float)(1u << (i - 1)) : 0.0f; c[7] = 0.0f;
+        cl->lpVtbl->SetPipelineState(cl, pso[i]);
+        cl->lpVtbl->SetGraphicsRootConstantBufferView(cl, 1, va);
+        cl->lpVtbl->OMSetStencilRef(cl, i ? 0xFFu : 0u);
+        cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+    }
+    de_transition(s, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    s_de.n_depth_conv++;
+    return 1;
 }
 
 /* Depth as floats in [0, 1] for a rectangle of a depth target. The engine
@@ -1233,7 +1411,7 @@ dummy:;
 
 static D3D12_GPU_DESCRIPTOR_HANDLE de_srv_table(const int* srv, u32 n)
 {
-    if (s_de.srv_gpu_next + n > DE_SRV_GPU_COUNT) { de_submit(); s_de.n_ring_wrap++; }
+    if (s_de.srv_gpu_next + n > s_de.srv_end) { de_submit(); s_de.n_ring_wrap++; }
     const u32 base = s_de.srv_gpu_next;
     s_de.srv_gpu_next += n;
     for (u32 i = 0; i < n; i++)
@@ -1294,8 +1472,8 @@ static void de_draw(void* user, rsx_topology topology, const void* vertices, u32
     const u64 need = vbytes + ibytes + DE_VPCONST_BYTES + DE_PSCONST_MIN + (s_de.psc_bytes > DE_PSCONST_MIN ? s_de.psc_bytes : 0) + 4096;
     /* Room for everything this draw takes, checked up front: a submit in the
      * middle would restart the rings under data this draw already wrote. */
-    if (s_de.ring_off + need > DE_RING_BYTES ||
-        s_de.srv_gpu_next + DE_PS_UNITS + DE_VS_UNITS > DE_SRV_GPU_COUNT) { de_submit(); s_de.n_ring_wrap++; }
+    if (s_de.ring_off + need > s_de.ring_end ||
+        s_de.srv_gpu_next + DE_PS_UNITS + DE_VS_UNITS > s_de.srv_end) { de_submit(); s_de.n_ring_wrap++; }
     if ((s_de.n_samp_tables + 2) * DE_PS_UNITS > DE_SAMP_GPU_COUNT) {
         de_submit();                 /* nothing in flight references a table now */
         s_de.n_samp_tables = 0;
@@ -1469,8 +1647,19 @@ static void de_present(void* user, u32 surface)
         de_transition(t, was);
     }
     de_transition_raw(bb, &bst, D3D12_RESOURCE_STATE_PRESENT);
-    de_submit();
-    s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0);
+    de_submit_frame();
+    /* Sync interval 0 by default. Present runs on the thread that also walks
+     * and translates the guest's FIFO, and with interval 1 it waited for the
+     * monitor's vblank there -- ~8.5 ms a frame in ICO, a third of that
+     * thread's time, all of it time the next frame's translation could not
+     * use. The guest is already paced by the emulated vblank, and in a window
+     * a flip-model swap chain hands the compositor the latest frame without
+     * tearing. D3D12ENG_VSYNC=1 restores the old wait. */
+    { static int vs = -1;
+      if (vs < 0) { const char* e = getenv("D3D12ENG_VSYNC"); vs = (e && atoi(e) > 0) ? 1 : 0; }
+      LARGE_INTEGER a, b; QueryPerformanceCounter(&a);
+      s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, (UINT)vs, 0);
+      QueryPerformanceCounter(&b); s_de_present_q += b.QuadPart - a.QuadPart; }
     s_de.n_present++;
 
     /* Titlebar stats, refreshed once a second (the recorder's are on a path
@@ -1542,6 +1731,12 @@ static void de_present(void* user, u32 surface)
                     (unsigned long long)s_de.n_submit, (unsigned long long)s_de.n_ring_wrap,
                     (unsigned long long)s_de.n_writes, (unsigned long long)s_de.n_depth_reads,
                     (unsigned long long)s_de.n_depth_conv, (unsigned long long)s_de.n_copies, 10);
+            { static unsigned long long p0; LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+              const unsigned long long np = s_de.n_present - p0; p0 = s_de.n_present;
+              fprintf(stderr, "[D3D12-ENG] per present: gpu-fence wait %.2f ms, Present() %.2f ms (%llu presents)%c",
+                      np ? (double)s_de_wait_q * 1000.0 / f.QuadPart / np : 0.0,
+                      np ? (double)s_de_present_q * 1000.0 / f.QuadPart / np : 0.0, np, 10);
+              s_de_wait_q = s_de_present_q = 0; }
         }
     }
 }
@@ -1584,6 +1779,7 @@ static const rsx_draw_backend s_d3d12_engine_backend = {
     .set_blend_color      = de_set_blend_color,
     .depth_as_color       = de_depth_as_color,
     .copy_region          = de_copy_region,
+    .depth_blit           = de_depth_blit,
 };
 
 #endif /* RSX_D3D12_ENGINE_IMPL_H */
