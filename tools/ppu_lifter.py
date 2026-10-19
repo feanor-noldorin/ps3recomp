@@ -4445,6 +4445,13 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
             # at the NEAREST definition of `cand`, so when one exists inside the
             # window the result is unchanged.
             for w in reversed(win_cand):
+                # The base is whatever `cand` held AT THE TABLE LOAD. Code
+                # between the load and the bctr may reuse the register: ICO
+                # func_001166EC ends its dispatch `lwzx r0,r9,r8; extsw r0,r0;
+                # add r8,r0,r8; mtctr r8`, and that `add` read as r8's nearest
+                # definition, so the base was never found.
+                if w.addr >= lwzx.addr:
+                    continue
                 a = [x.strip() for x in w.operands.split(',')]
                 if not a or a[0] != cand or w.mnemonic.startswith(('st', 'lf')):
                     continue                    # not a GPR def: a store READS it; ppu_disasm names lfs/lfd's FPR target rN
@@ -4461,6 +4468,46 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                     # main loop spun forever without ever issuing a draw.)
                     _mid = a[1][a[1].index('(') + 1:-1].strip()
                     _d2 = mem_disp(a[1]); _d2_is_ld = (w.mnemonic == 'ld')
+                    if _mid == 'r1':
+                        # SPILLED base: `lwz r8,d(r2); std r8,S(r1)` early in the
+                        # function, `ld r8,S(r1)` at the switch. The register
+                        # pressure of a long function pushes the base out to the
+                        # stack frame, and r1 is no table pointer, so the
+                        # two-level path below finds nothing. (ICO func_001166EC,
+                        # the boy's 0x76-state controller: its switch lifted to an
+                        # unresolved indirect call, the task returned on its first
+                        # pass and the player never moved.) Follow the slot back
+                        # to every store into it in the enclosing function and
+                        # accept the base only when all of them store a register
+                        # whose nearest prior definition is the SAME TOC load.
+                        _fseg = _live(_scan_lo(i), i)
+                        _found = set()
+                        _bad = False
+                        for _k, _st in enumerate(_fseg):
+                            if _st.mnemonic not in ('std', 'stw'):
+                                continue
+                            _sa = [x.strip() for x in _st.operands.split(',')]
+                            if (len(_sa) != 2 or '(r1)' not in _sa[1].replace(' ', '')
+                                    or mem_disp(_sa[1]) != _d2):
+                                continue
+                            _src, _hit = _sa[0], None
+                            for _w3 in reversed(_fseg[:_k]):
+                                _b3 = [x.strip() for x in _w3.operands.split(',')]
+                                if not _b3 or _b3[0] != _src or _w3.mnemonic.startswith(('st', 'lf')):
+                                    continue
+                                if (_w3.mnemonic in ('lwz', 'ld') and len(_b3) == 2
+                                        and '(r2)' in _b3[1]):
+                                    _hit = (mem_disp(_b3[1]), _w3.mnemonic == 'ld')
+                                break
+                            if _hit is None:
+                                _bad = True
+                            else:
+                                _found.add(_hit)
+                        _dbg(all_insns[i].addr, f"spill slot {_d2:#x}: stores->{_found} bad={_bad} seg={len(_fseg)} lo={_fseg[0].addr if _fseg else 0:#x}")
+                        if not _bad and len(_found) == 1:
+                            disp, base_is_ld = next(iter(_found))
+                            r_base = cand
+                        break
                     # The intermediate register is usually a FUNCTION-SCOPE base
                     # pointer: SN loads it once in the prologue and every switch
                     # in the body reads through it. flOw's func_0060F6F8 loads

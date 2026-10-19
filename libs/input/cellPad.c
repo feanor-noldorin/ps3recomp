@@ -7,7 +7,9 @@
  *   - Windows default: XInput (no extra dependencies)
  *   - Everywhere else / if PS3RECOMP_PAD_USE_SDL2 is defined: SDL2 GameController
  *
- * Define PS3RECOMP_PAD_USE_SDL2 to force SDL2 backend on Windows.
+ * Define PS3RECOMP_PAD_USE_SDL2 (CMake: -DPS3RECOMP_PAD_SDL2=ON) on Windows to
+ * read controllers through SDL2 -- DualSense, DualShock 4 and a DualShock 3
+ * behind a HID driver -- with XInput as the fallback if SDL2 fails to start.
  */
 
 #include <time.h>
@@ -23,7 +25,13 @@
  * Backend selection
  * -----------------------------------------------------------------------*/
 
-#if defined(PS3RECOMP_PAD_USE_SDL2)
+#if defined(PS3RECOMP_PAD_USE_SDL2) && defined(_WIN32)
+  /* Both: SDL2 reads every controller it can (DualSense, DualShock 4, a
+   * DualShock 3 behind a HID driver, and XInput pads too); XInput is the
+   * fallback when SDL2 does not start. The keyboard fallback stays. */
+  #define PAD_BACKEND_SDL2  1
+  #define PAD_BACKEND_XINPUT 1
+#elif defined(PS3RECOMP_PAD_USE_SDL2)
   #define PAD_BACKEND_SDL2  1
   #define PAD_BACKEND_XINPUT 0
 #elif defined(_WIN32)
@@ -44,7 +52,19 @@
 #endif
 
 #if PAD_BACKEND_SDL2
-  #include <SDL2/SDL.h>
+  #define SDL_MAIN_HANDLED   /* the title's main() stays its own */
+  #if defined(__has_include)
+    #if __has_include(<SDL2/SDL.h>)
+      #include <SDL2/SDL.h>
+    #else
+      #include <SDL.h>       /* the VC development package's include/ */
+    #endif
+  #else
+    #include <SDL2/SDL.h>
+  #endif
+  #ifndef _WIN32
+    #include <stdatomic.h>
+  #endif
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -85,6 +105,7 @@ static int s_data_fresh[PAD_MAX_HOST_PORTS];
 #if PAD_BACKEND_SDL2
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 static int s_sdl_inited = 0;
+static int s_sdl_ok = 0;      /* SDL's game-controller subsystem is up */
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -140,7 +161,10 @@ static int pad_host_window_focused(void)
     return pid == GetCurrentProcessId();
 }
 
-static void pad_poll_keyboard(void)
+/* merge = a controller already filled port 0 on this sweep: the keys are
+ * added to it (buttons OR'd, the left stick taken from the arrows only while
+ * one is held) instead of replacing it, so keyboard and pad work together. */
+static void pad_poll_keyboard(int merge)
 {
     static int off = -1;
     if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
@@ -148,6 +172,7 @@ static void pad_poll_keyboard(void)
 
     PadHostState* hs = &s_host_state[0];
     if (!pad_host_window_focused()) {
+        if (merge) return;   /* the controller's own state stands */
         /* Release everything on focus loss, or a key held while alt-tabbing
          * would stay down forever. */
         hs->buttons = 0;
@@ -170,6 +195,17 @@ static void pad_poll_keyboard(void)
     u16 btns = 0;
     for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
         if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
+
+    if (merge) {
+        hs->buttons |= btns;
+        if (btns & CELL_PAD_CTRL_LEFT)  hs->analog_lx = 0;
+        if (btns & CELL_PAD_CTRL_RIGHT) hs->analog_lx = 255;
+        if (btns & CELL_PAD_CTRL_UP)    hs->analog_ly = 0;
+        if (btns & CELL_PAD_CTRL_DOWN)  hs->analog_ly = 255;
+        if (btns & CELL_PAD_CTRL_L2)    hs->trigger_l2 = 255;
+        if (btns & CELL_PAD_CTRL_R2)    hs->trigger_r2 = 255;
+        return;
+    }
 
     hs->buttons   = btns;
     hs->connected = 1;
@@ -251,16 +287,6 @@ static void pad_poll_xinput(void)
     }
 }
 
-static void pad_init_backend(void)
-{
-    /* XInput needs no explicit init */
-}
-
-static void pad_shutdown_backend(void)
-{
-    /* XInput needs no explicit shutdown */
-}
-
 #endif /* PAD_BACKEND_XINPUT */
 
 /* ---------------------------------------------------------------------------
@@ -271,7 +297,10 @@ static void pad_shutdown_backend(void)
 
 static u8 pad_sdl_axis_to_u8(int raw)
 {
-    /* SDL axis: -32768..32767 -> 0..255 with center at 128 */
+    /* SDL axis: -32768..32767 -> 0..255 with center at 128. A resting stick
+     * drifts a few counts either way; snap that to exactly 128, since 127
+     * has been read as a deflection (see the XInput path's note on it). */
+    if (raw > -2500 && raw < 2500) return 128;
     int val = ((raw + 32768) * 255) / 65535;
     if (val < 0) val = 0;
     if (val > 255) val = 255;
@@ -287,32 +316,105 @@ static u8 pad_sdl_trigger_to_u8(int raw)
     return (u8)val;
 }
 
+/* PAD_SQUIRCLE[=<factor>]: push a stick's round range out toward a square.
+ *
+ * A DualShock 3 reports nearly full deflection on BOTH axes at a diagonal; a
+ * DualShock 4 / DualSense reports a circle, so a diagonal comes out at about
+ * 0.7 of full on each axis. A title that measures speed per axis then sees a
+ * half-pushed stick on every diagonal. This scales the radius by
+ * 1 + sin^2(2*angle) / (factor / 1000) -- no change on the axes, the most at
+ * 45 degrees -- and clamps to the 0..255 range. On by default with factor
+ * 8000 (ICO: a circle on a DualSense dropped the boy from a run to a walk
+ * on every diagonal; with this it holds the run); PAD_SQUIRCLE=0 turns it
+ * off, PAD_SQUIRCLE=<n> >= 100 sets the factor. */
+static void pad_squircle(u8* px, u8* py)
+{
+    static float k = -1.0f;
+    if (k < 0.0f) {
+        const char* e = getenv("PAD_SQUIRCLE");
+        int f = (e && *e) ? atoi(e) : 8000;
+        if (e && *e && f > 0 && f < 100) f = 8000;
+        k = f > 0 ? 1000.0f / (float)f : 0.0f;
+        if (k > 0.0f) printf("[cellPad] PAD_SQUIRCLE factor %d\n", f);
+    }
+    if (k == 0.0f) return;
+    const float x = ((float)*px - 128.0f) / 127.0f, y = ((float)*py - 128.0f) / 127.0f;
+    const float r = sqrtf(x * x + y * y);
+    if (r == 0.0f) return;
+    const float a = atan2f(y, x), s = sinf(2.0f * a);
+    const float rr = r * (1.0f + s * s * k);
+    int nx = (int)lrintf(128.0f + rr * cosf(a) * 127.0f);
+    int ny = (int)lrintf(128.0f + rr * sinf(a) * 127.0f);
+    *px = (u8)(nx < 0 ? 0 : nx > 255 ? 255 : nx);
+    *py = (u8)(ny < 0 ? 0 : ny > 255 ? 255 : ny);
+}
+
+/* Open the first game controller SDL knows that no slot holds yet, into slot
+ * `slot`. SDL's device indices shift as devices come and go, so slots are
+ * matched on joystick instance ids rather than on indices. */
+static void pad_sdl_open_into(int slot)
+{
+    const int num = SDL_NumJoysticks();
+    for (int d = 0; d < num; d++) {
+        if (!SDL_IsGameController(d)) continue;
+        const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(d);
+        int taken = 0;
+        for (int j = 0; j < PAD_MAX_HOST_PORTS; j++) {
+            SDL_GameController* o = s_sdl_controllers[j];
+            if (o && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(o)) == id) taken = 1;
+        }
+        if (taken) continue;
+        SDL_GameController* gc = SDL_GameControllerOpen(d);
+        if (!gc) continue;
+        s_sdl_controllers[slot] = gc;
+        const char* name = SDL_GameControllerName(gc);
+        printf("[cellPad] port %d: %s (SDL2, type %d)\n", slot,
+               name ? name : "controller", (int)SDL_GameControllerGetType(gc));
+        return;
+    }
+}
+
 static void pad_poll_sdl2(void)
 {
+    /* cellPadGetData runs on whichever guest thread polls; SDL's controller
+     * calls are not meant to run on two threads at once. A poller that finds
+     * another one inside simply serves the cached state. */
+#ifdef _WIN32
+    static volatile LONG busy = 0;
+    if (InterlockedCompareExchange(&busy, 1, 0) != 0) return;
+#else
+    static atomic_flag busy = ATOMIC_FLAG_INIT;
+    if (atomic_flag_test_and_set(&busy)) return;
+#endif
     SDL_GameControllerUpdate();
 
-    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
-        if (!s_sdl_controllers[i]) {
-            /* Try to open newly connected controllers */
-            if (SDL_IsGameController(i)) {
-                s_sdl_controllers[i] = SDL_GameControllerOpen(i);
-            }
-        }
+    /* Look for new devices every ~0.5 s, not on every 4 ms sweep. */
+    static unsigned scan = 0;
+    const int rescan = (scan++ % 128u) == 0;
 
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         SDL_GameController* gc = s_sdl_controllers[i];
-        if (!gc || !SDL_GameControllerGetAttached(gc)) {
+        if (gc && !SDL_GameControllerGetAttached(gc)) {
+            printf("[cellPad] port %d: controller removed (SDL2)\n", i);
+            SDL_GameControllerClose(gc);
+            s_sdl_controllers[i] = gc = NULL;
+        }
+        if (!gc && rescan) {
+            pad_sdl_open_into(i);
+            gc = s_sdl_controllers[i];
+        }
+        if (!gc) {
             s_host_state[i].connected = 0;
-            if (gc) {
-                SDL_GameControllerClose(gc);
-                s_sdl_controllers[i] = NULL;
-            }
             continue;
         }
 
         s_host_state[i].connected = 1;
 
+        /* SDL names face buttons by position (A = bottom), which on a
+         * PlayStation pad is cross / circle / square / triangle. */
         u16 btns = 0;
         if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_BACK))          btns |= CELL_PAD_CTRL_SELECT;
+        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_TOUCHPAD))      btns |= CELL_PAD_CTRL_SELECT;
         if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSTICK))     btns |= CELL_PAD_CTRL_L3;
         if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSTICK))    btns |= CELL_PAD_CTRL_R3;
         if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_START))         btns |= CELL_PAD_CTRL_START;
@@ -335,11 +437,13 @@ static void pad_poll_sdl2(void)
 
         s_host_state[i].buttons = btns;
 
-        /* Analog sticks */
+        /* Analog sticks. SDL's Y grows downward, as the PS3's does. */
         s_host_state[i].analog_lx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX));
         s_host_state[i].analog_ly = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY));
         s_host_state[i].analog_rx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX));
         s_host_state[i].analog_ry = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY));
+        pad_squircle(&s_host_state[i].analog_lx, &s_host_state[i].analog_ly);
+        pad_squircle(&s_host_state[i].analog_rx, &s_host_state[i].analog_ry);
 
         /* Triggers */
         s_host_state[i].trigger_l2 = pad_sdl_trigger_to_u8(lt);
@@ -357,28 +461,49 @@ static void pad_poll_sdl2(void)
         s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
         s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
     }
+#ifdef _WIN32
+    InterlockedExchange(&busy, 0);
+#else
+    atomic_flag_clear(&busy);
+#endif
 }
 
-static void pad_init_backend(void)
+static void pad_sdl2_init(void)
 {
     if (!s_sdl_inited) {
-        if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0) {
-            SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+        /* PlayStation pads through SDL's own HID drivers: DualShock 4 and
+         * DualSense are on by default, the DualShock 3 is not (on Windows it
+         * needs a HID driver such as DsHidMini in SXS mode). Rumble on the
+         * newer pads needs their extended reports. There is no SDL window, so
+         * controller input must not depend on one having focus. */
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS3, "1");
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
+        SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#ifdef _WIN32
+        SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
+#endif
+        if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0 &&
+            SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
+            printf("[cellPad] SDL2 controller init failed: %s\n", SDL_GetError());
+            s_sdl_ok = 0;
+        } else {
+            s_sdl_ok = 1;
+            SDL_version v; SDL_GetVersion(&v);
+            printf("[cellPad] SDL2 %d.%d.%d controller backend up\n", v.major, v.minor, v.patch);
         }
         s_sdl_inited = 1;
     }
     memset(s_sdl_controllers, 0, sizeof(s_sdl_controllers));
 
     /* Open any controllers already connected */
-    int num = SDL_NumJoysticks();
-    for (int i = 0; i < num && i < PAD_MAX_HOST_PORTS; i++) {
-        if (SDL_IsGameController(i)) {
-            s_sdl_controllers[i] = SDL_GameControllerOpen(i);
-        }
+    if (s_sdl_ok) {
+        SDL_GameControllerUpdate();
+        for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) pad_sdl_open_into(i);
     }
 }
 
-static void pad_shutdown_backend(void)
+static void pad_sdl2_shutdown(void)
 {
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         if (s_sdl_controllers[i]) {
@@ -389,6 +514,20 @@ static void pad_shutdown_backend(void)
 }
 
 #endif /* PAD_BACKEND_SDL2 */
+
+static void pad_init_backend(void)
+{
+#if PAD_BACKEND_SDL2
+    pad_sdl2_init();   /* XInput needs no explicit init */
+#endif
+}
+
+static void pad_shutdown_backend(void)
+{
+#if PAD_BACKEND_SDL2
+    pad_sdl2_shutdown();
+#endif
+}
 
 /* ---------------------------------------------------------------------------
  * Poll dispatcher
@@ -434,13 +573,15 @@ static void pad_poll_backend(void)
      * every port. cellPadGetData hands each one out exactly once. */
     for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) s_data_fresh[_i] = 1;
 
-#if PAD_BACKEND_XINPUT
+#if PAD_BACKEND_SDL2 && PAD_BACKEND_XINPUT
+    if (s_sdl_ok) pad_poll_sdl2(); else pad_poll_xinput();
+#elif PAD_BACKEND_XINPUT
     pad_poll_xinput();
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
 #ifdef _WIN32
-    if (!s_host_state[0].connected) pad_poll_keyboard();
+    pad_poll_keyboard(s_host_state[0].connected);
 #endif
 }
 
@@ -861,6 +1002,25 @@ emit:
               }
           }
       } }
+    /* PAD_TRACE=1: one line per port-0 packet whose contents differ from the
+     * previous one, with a millisecond timestamp -- what the title actually
+     * received, at the rate it read it. PAD_DBG's 2 s summary cannot show a
+     * one-frame gap between two key presses or the path a stick takes. */
+    { static int tr = -1; static unsigned long long t0 = 0; static u16 last[8];
+      if (tr < 0) { tr = getenv("PAD_TRACE") ? 1 : 0; t0 = pad_now_ms(); }
+      if (tr && port_no == 0 && data->len) {
+          const u16 cur[8] = { data->button[CELL_PAD_BTN_OFFSET_DIGITAL1],
+                               data->button[CELL_PAD_BTN_OFFSET_DIGITAL2],
+                               data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X],
+                               data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y],
+                               data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X],
+                               data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y], 0, 0 };
+          if (memcmp(cur, last, sizeof cur) != 0) {
+              memcpy(last, cur, sizeof cur);
+              fprintf(stderr, "[PAD_TRACE] %llu d1=%02X d2=%02X lx=%u ly=%u rx=%u ry=%u%c",
+                      pad_now_ms() - t0, cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], 10);
+          }
+      } }
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
@@ -1103,12 +1263,20 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
 
     param = GUEST_PTR(param, CellPadActParam*);
 
+    /* The PS3's small motor is on/off (0 or 1), the large one 0..255. */
+    const unsigned act_small = param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] ? 65535u : 0u;
+    const unsigned act_large = param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257u;
+    (void)act_small; (void)act_large;
+
 #if PAD_BACKEND_XINPUT
-    /* Map to XInput vibration */
+    /* Map to XInput vibration (SDL2, when it is up, drives the pads itself) */
+#if PAD_BACKEND_SDL2
+    if (!s_sdl_ok)
+#endif
     if (port_no < PAD_MAX_HOST_PORTS && s_host_state[port_no].connected) {
         XINPUT_VIBRATION vib;
-        vib.wLeftMotorSpeed  = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257);
-        vib.wRightMotorSpeed = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257);
+        vib.wLeftMotorSpeed  = (WORD)act_large;
+        vib.wRightMotorSpeed = (WORD)act_small;
         XInputSetState((DWORD)port_no, &vib);
     }
 #endif
@@ -1117,9 +1285,8 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
     if (port_no < PAD_MAX_HOST_PORTS && s_sdl_controllers[port_no]) {
         SDL_GameControllerRumble(
             s_sdl_controllers[port_no],
-            (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257),
-            (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257),
-            100 /* duration ms */
+            (Uint16)act_large, (Uint16)act_small,
+            250 /* ms; a title holding a rumble re-sends it every frame */
         );
     }
 #endif
