@@ -292,11 +292,28 @@ typedef struct spu_mfc_slot {
 static spu_mfc_slot* s_mfc_slots;
 static SRWLOCK s_mfc_claim_lock = SRWLOCK_INIT;
 
+/* Per-thread lookup cache. mfc_for runs on every MFC channel access, and
+ * taking the shared registry lock each time -- with ~10 SPU host threads, most
+ * of them in rchcnt/rdch polling loops -- made the lock's cache line the
+ * hottest thing in the process: ICO's SPU renderer spent ~85% of its time in
+ * AcquireSRWLockShared/Release, and it is on the frame's critical path. The
+ * cache is (ctx, engine) for the context this thread used last, valid while
+ * the registry generation is unchanged; every removal bumps the generation
+ * under the writer lock, so a cached engine can never outlive its slot. */
+static volatile LONG s_mfc_gen;
+static SPU_TLS spu_context* t_mfc_ctx;
+static SPU_TLS mfc_engine*  t_mfc_eng;
+static SPU_TLS LONG         t_mfc_gen = -1;
+
 static mfc_engine* mfc_for(spu_context* ctx)
 {
+    static int s_tls = -1;  /* SPU_MFC_TLS=0: always take the registry lock (bisect switch) */
+    if (s_tls < 0) { const char* e = getenv("SPU_MFC_TLS"); s_tls = e ? atoi(e) : 1; }
+    if (s_tls && t_mfc_ctx == ctx && t_mfc_gen == s_mfc_gen) return t_mfc_eng;
     AcquireSRWLockShared(&s_mfc_claim_lock);
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
         if (slot->ctx == ctx) {
+            t_mfc_ctx = ctx; t_mfc_eng = &slot->mfc; t_mfc_gen = s_mfc_gen;
             ReleaseSRWLockShared(&s_mfc_claim_lock);
             return &slot->mfc;
         }
@@ -322,6 +339,7 @@ static mfc_engine* mfc_for(spu_context* ctx)
     mfc_engine_init(&slot->mfc);
     slot->next = s_mfc_slots;
     s_mfc_slots = slot;
+    t_mfc_ctx = ctx; t_mfc_eng = &slot->mfc; t_mfc_gen = s_mfc_gen;
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
     return &slot->mfc;
 }
@@ -334,6 +352,7 @@ void spu_mfc_release(spu_context* ctx)
         if ((*link)->ctx != ctx) continue;
         spu_mfc_slot* slot = *link;
         *link = slot->next;
+        InterlockedIncrement(&s_mfc_gen);   /* invalidate every thread's cache */
         free(slot);
         break;
     }
@@ -350,6 +369,7 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
         uintptr_t owner = (uintptr_t)slot->ctx;
         if (owner >= lo && owner < hi) {
             *link = slot->next;
+            InterlockedIncrement(&s_mfc_gen);
             free(slot);
         } else {
             link = &slot->next;

@@ -68,6 +68,17 @@ float rsx_rd_half_be(const u8* p);  /* 2-byte IEEE half -> float  */
  */
 void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4]);
 
+/* NV4097 INLINE_ARRAY source. While set, rsx_fetch_attrib reads every
+ * attribute from these FIFO-supplied bytes (big-endian, as in guest memory)
+ * at vi * stride + off[idx] instead of from the guest vertex arrays. Set by
+ * rsx_commands.c around the backend draw of one inline batch. */
+typedef struct {
+    const u8* data;
+    u32       bytes, stride;
+    u32       off[RSX_MAX_VERTEX_ATTRIBS];
+} rsx_inline_vertex_src;
+extern const rsx_inline_vertex_src* g_rsx_inline_src;
+
 #ifdef __cplusplus
 }
 #endif

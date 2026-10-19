@@ -193,6 +193,25 @@ static int gcm_flipcb_on_tick_only(void)
     return v;
 }
 
+/* GCM_PREPAREFLIP_QUEUE=1: cellGcmSetPrepareFlip only queues the flip and
+ * returns its id; cellGcmSetFlipImmediate on that id is what flips it.
+ *
+ * ICO paces this way: it writes the PrepareFlip return value into a label
+ * right after the call, and its vblank handler, once the RSX has reached that
+ * label and its swap-interval countdown has run out, calls SetFlipImmediate
+ * with it and derives the frame time from the vblanks elapsed. With
+ * PrepareFlip returning CELL_OK (0) and flipping at once, the label never
+ * changed, the handler never flipped, the frame time stayed 0 and the title
+ * ran as fast as its frames-in-flight throttle allowed instead of at its
+ * swap interval. Inferred from the title's code; off by default. */
+static int gcm_prepareflip_queue(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("GCM_PREPAREFLIP_QUEUE") ? 1 : 0;
+    return v;
+}
+static volatile u32 s_prepared_flips = 0;   /* bit n: buffer n queued */
+
 static u32 s_vblank_handler_opd   = 0;
 static u32 s_user_handler_opd     = 0;
 static u32 s_second_v_handler_opd = 0;
@@ -682,6 +701,54 @@ static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
 #define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
 #endif
 
+/* GCM_FLIPCB_ONTICK=1 flip accounting: one guest flip handler per flip.
+ *
+ * Pending flip work is otherwise a single bit, set by cellGcmTickFlip only
+ * while the status is WAITING. Two flips between pumps therefore earn one
+ * handler call, and a flip that never shows as WAITING earns none --
+ * cellGcmSetPrepareFlip completes the status at request time and, under
+ * ONTICK, skips its own call too. A title that counts completed frames in its
+ * flip handler falls behind for good: ICO submits through SetPrepareFlip, got
+ * one handler for five flips, and parked its frames-in-flight throttle.
+ *
+ * So under ONTICK every request is counted (outstanding), each tick completes
+ * one of them the way a vsync would (owed), and the pump delivers the handler
+ * once per completed flip. Without ONTICK nothing here runs and the existing
+ * request-time behaviour is unchanged. */
+#ifdef _WIN32
+static volatile LONG s_flips_outstanding = 0, s_flips_owed = 0;
+static void gcm_flip_count_request(void)
+{
+    if (gcm_flipcb_on_tick_only()) InterlockedIncrement(&s_flips_outstanding);
+}
+static int gcm_flip_complete_one(void)   /* 1 if an outstanding flip completed */
+{
+    LONG v;
+    do {
+        v = s_flips_outstanding;
+        if (v <= 0) return 0;
+    } while (InterlockedCompareExchange(&s_flips_outstanding, v - 1, v) != v);
+    InterlockedIncrement(&s_flips_owed);
+    return 1;
+}
+#define GCM_FLIPS_OWED_TAKE() ((long)InterlockedExchange(&s_flips_owed, 0))
+#else
+static atomic_long s_flips_outstanding = 0, s_flips_owed = 0;
+static void gcm_flip_count_request(void)
+{
+    if (gcm_flipcb_on_tick_only()) atomic_fetch_add(&s_flips_outstanding, 1);
+}
+static int gcm_flip_complete_one(void)
+{
+    long v = atomic_load(&s_flips_outstanding);
+    do { if (v <= 0) return 0; }
+    while (!atomic_compare_exchange_weak(&s_flips_outstanding, &v, v - 1));
+    atomic_fetch_add(&s_flips_owed, 1);
+    return 1;
+}
+#define GCM_FLIPS_OWED_TAKE() ((long)atomic_exchange(&s_flips_owed, 0))
+#endif
+
 /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
  * and mark a vblank+flip tick pending for the main thread to deliver. */
 static u32 s_fifo_getoff;   /* tentative: defined below */
@@ -733,7 +800,9 @@ void ppu_gcm_pump(void)
     }
     if (p & 2) {
         s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-        if (s_flip_handler_opd && g_ps3_guest_caller) {
+        /* Under ONTICK, once per flip the ticks completed; otherwise once. */
+        long n = gcm_flipcb_on_tick_only() ? GCM_FLIPS_OWED_TAKE() : 1;
+        for (; n > 0 && s_flip_handler_opd && g_ps3_guest_caller; n--) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
         }
@@ -763,6 +832,11 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
  * the callback IS the flip interrupt -- no flip, no callback. */
 void cellGcmTickFlip(void)
 {
+    if (gcm_flipcb_on_tick_only()) {
+        /* One requested flip completes per tick, as at vsync. */
+        if (gcm_flip_complete_one()) GCM_PENDING_SET(2);
+        return;
+    }
     if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING)
         GCM_PENDING_SET(2);
 }
@@ -934,6 +1008,74 @@ static void nv3089_blit(void)
                      s_nv309e.active, 10);
           }
       } }
+#ifdef _WIN32
+    /* GCM_NV3089_GPU_COPY=1 (D3D12 backend): a surface bounced through main
+     * memory by two 1:1 blits -- local -> main, then main -> local, with SPU
+     * work in between (ICO's Edge MLAA) -- becomes one ordered GPU copy
+     * between the two surfaces. The D3D12 backend keeps surfaces on the GPU
+     * only, so the guest-memory copies below move zeros. The SPU pass is
+     * skipped; the CPU copies still run unchanged. */
+    { static int gc = -1;
+      if (gc < 0) { const char* e = getenv("GCM_NV3089_GPU_COPY"); gc = e ? atoi(e) : 0; }
+      /* The same bounce on the shared draw engine: GPU shadows there too,
+       * and the guest-memory copy and its read/write syncs are skipped. */
+      if (gc && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
+          rsx_draw_engine_enabled() &&
+          (s_nv3089.fmt & 0xFFu) != 7u && (s_nv3089.fmt & 0xFFu) != 8u &&   /* 32-bit pixels */
+          s_gcm2d.color_fmt != 4u && s_gcm2d.color_fmt != 1u) {
+          const int src_local = (s_nv3089.src_dma != 0xFEED0001u);
+          const int dst_local = (s_gcm2d.dst_dma  != 0xFEED0001u);
+          const u32 u0 = (s_nv3089.in_uv & 0xFFFF) >> 4, v0 = (s_nv3089.in_uv >> 16) >> 4;
+          const u32 src = s_nv3089.in_off + v0 * in_pitch + u0 * 4u;
+          const u32 dst = s_gcm2d.dst_offset + out_y * dst_pitch + out_x * 4u;
+          int done = 0;
+          if (src_local && !dst_local)
+              done = rsx_draw_engine_shadow_out(src, in_pitch, dst, out_w, out_h);
+          else if (!src_local && dst_local)
+              done = rsx_draw_engine_shadow_in(src, dst, dst_pitch, out_w, out_h);
+          { static int n = 0;
+            if (n < 6) { n++; fprintf(stderr, "[NV3089] engine GPU shadow %s %ux%u src=0x%X dst=0x%X: %s\n",
+                                      src_local ? "out" : "in", out_w, out_h, src, dst,
+                                      done ? "done" : "fallback"); } }
+          if (done) return;
+      }
+      if (gc && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
+          !rsx_live_draw_enabled() && !rsx_draw_engine_enabled()) {
+          extern int rsx_d3d12_record_rt_copy(u32, u32, u32, u32, u32, u32);
+          static struct { u32 main, src, pitch, w, h; } bounce[16];
+          static unsigned nb;
+          const int src_local = (s_nv3089.src_dma != 0xFEED0001u);
+          const int dst_local = (s_gcm2d.dst_dma  != 0xFEED0001u);
+          const u32 u0 = (s_nv3089.in_uv & 0xFFFF) >> 4, v0 = (s_nv3089.in_uv >> 16) >> 4;
+          const u32 src = s_nv3089.in_off + v0 * in_pitch + u0 * 4u;
+          const u32 dst = s_gcm2d.dst_offset + out_y * dst_pitch + out_x * 4u;
+          /* The first blit is a snapshot: main memory keeps the surface as it
+           * was then, and the second blit can come frames later -- after the
+           * title has cleared that surface for a new frame (ICO's MLAA round
+           * trip; copying the live surface at the second blit showed a freshly
+           * cleared target, the flickering white frame). So copy into a GPU
+           * "shadow" of the main-memory range at the first blit, and from the
+           * shadow at the second. Shadows are keyed by the main offset with
+           * bit 31 set, which no local surface offset has. */
+          #define GPU_SHADOW(o) (0x80000000u | (o))
+          if (src_local && !dst_local) {
+              unsigned i = 0;
+              while (i < nb && bounce[i].main != dst) i++;
+              if (i == nb && nb < 16) nb++;
+              if (i < nb) { bounce[i].main = dst; bounce[i].src = src; bounce[i].pitch = in_pitch;
+                            bounce[i].w = out_w; bounce[i].h = out_h; }
+              rsx_d3d12_record_rt_copy(src, in_pitch, GPU_SHADOW(dst), dst_pitch, out_w, out_h);
+          } else if (!src_local && dst_local) {
+              for (unsigned i = 0; i < nb; i++)
+                  if (bounce[i].main == src && bounce[i].w == out_w && bounce[i].h == out_h) {
+                      rsx_d3d12_record_rt_copy(GPU_SHADOW(src), in_pitch, dst, dst_pitch,
+                                               out_w, out_h);
+                      break;
+                  }
+          }
+          #undef GPU_SHADOW
+      } }
+#endif
     /* A copy out of a surface the live renderer drew exists only on the GPU;
      * mirror 1:1 blits there too (the guest-memory copy below still runs). */
     if (s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
@@ -1083,6 +1225,80 @@ static void nv3089_blit(void)
       if (cap && _n < cap) { _n++;
         printf("[NV3089] %ux%u fmt=0x%X src=0x%08X(pitch %u) -> dst=0x%08X(pitch %u) at %u,%u\n",
                out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
+}
+
+/* RSX_CENSUS=1: per (subchannel, method) census of what the title actually
+ * sends -- count, how often the 3D parser declined it (rsx_process_method
+ * returned -1), which path took it, and up to 32 distinct values for state
+ * methods (texture formats, remaps, surface formats ...). Data-stream methods
+ * (constants, programs, inline/immediate vertex data) are only counted.
+ * Every 30 s the cumulative table is written to
+ * <RSX_CENSUS_DIR or .>/rsx_census_NNNN.txt (NNNN = seconds since the first
+ * method); the difference of two files isolates a stretch of the game.
+ * Diagnostic only: the methods are processed exactly as before. */
+enum { CENSUS_3D = 1, CENSUS_2D = 2, CENSUS_DRV = 4 };
+#define CENSUS_NVAL 32
+typedef struct { u64 n, unh; u32 nv, over, paths; u32 v[CENSUS_NVAL]; } census_slot;
+static census_slot* s_census;
+static int census_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("RSX_CENSUS") ? 1 : 0;
+        if (on) s_census = (census_slot*)calloc(8u * 2048u, sizeof(census_slot));
+        if (!s_census) on = 0;
+    }
+    return on;
+}
+static int census_is_stream(u32 m)
+{
+    return (m >= 0x0B80u && m < 0x0C00u)   /* TRANSFORM_PROGRAM window   */
+        || (m >= 0x1F00u && m < 0x1F80u)   /* TRANSFORM_CONSTANT window  */
+        || (m >= 0x1880u && m < 0x1A00u)   /* VERTEX_DATA2F/2S/4UB/4S_M  */
+        || (m >= 0x1C00u && m < 0x1D00u)   /* VERTEX_DATA4F_M            */
+        || (m >= 0x1E40u && m < 0x1E80u)   /* VERTEX_DATA1F_M            */
+        || (m >= 0x1500u && m < 0x1600u)   /* VERTEX_DATA3F_M            */
+        || m == 0x1818u                    /* INLINE_ARRAY               */
+        || m == 0x1814u || m == 0x1824u;   /* DRAW_ARRAYS / INDEX_ARRAY  */
+}
+static void census_dump(unsigned secs)
+{
+    const char* dir = getenv("RSX_CENSUS_DIR");
+    char path[512];
+    snprintf(path, sizeof path, "%s/rsx_census_%04u.txt", (dir && *dir) ? dir : ".", secs);
+    FILE* f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "# rsx census at %u s: subch method paths count unhandled ndistinct values\n", secs);
+    for (u32 i = 0; i < 8u * 2048u; i++) {
+        const census_slot* c = &s_census[i];
+        if (!c->n) continue;
+        fprintf(f, "s%u 0x%04X %s%s%s n=%llu unh=%llu vals=%u%s", i >> 11, (i & 2047u) << 2,
+                (c->paths & CENSUS_3D) ? "3d" : "", (c->paths & CENSUS_2D) ? "2d" : "",
+                (c->paths & CENSUS_DRV) ? "drv" : "",
+                (unsigned long long)c->n, (unsigned long long)c->unh, c->nv, c->over ? "+" : "");
+        for (u32 k = 0; k < c->nv; k++) fprintf(f, " %08X", c->v[k]);
+        fputc('\n', f);
+    }
+    fclose(f);
+}
+static void census_note(u32 subch, u32 m, u32 data, u32 path, int ret)
+{
+    static unsigned long long t0, next;
+    static u32 tick;
+    census_slot* c = &s_census[((subch & 7u) << 11) | ((m >> 2) & 2047u)];
+    c->n++;
+    c->paths |= path;
+    if (ret < 0) c->unh++;
+    if (!census_is_stream(m)) {
+        u32 k = 0;
+        while (k < c->nv && c->v[k] != data) k++;
+        if (k == c->nv) { if (c->nv < CENSUS_NVAL) c->v[c->nv++] = data; else c->over = 1; }
+    }
+    if ((++tick & 0xFFFFu) == 0) {
+        const unsigned long long now = ps3_ms_now();
+        if (!t0) { t0 = now; next = now + 30000; }
+        if (now >= next) { census_dump((unsigned)((now - t0) / 1000)); next += 30000; }
+    }
 }
 
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
@@ -1982,10 +2198,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 { const u32 mfull = (subch << 13) | m;
                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
                     cellGcmQueueUserCommand(vm_read32(dea));
+                    if (census_enabled()) census_note(subch, m, vm_read32(dea), CENSUS_DRV, 0);
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
+                    if (census_enabled()) census_note(subch, m, vm_read32(dea), CENSUS_DRV, 0);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    rsx_process_method(&s_state, m, vm_read32(dea));
+                    const int pret = rsx_process_method(&s_state, m, vm_read32(dea));
+                    /* GET_REPORT and its DMA are handled right below, not by the parser. */
+                    if (census_enabled())
+                        census_note(subch, m, vm_read32(dea), CENSUS_3D,
+                                    (m == 0x1A8 || m == 0x1800) ? 0 : pret);
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */
@@ -2015,8 +2237,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             s_report_data[idx].value = val;
                         }
                     }
-                } else
+                } else {
                     gcm_2d_method(subch, m, vm_read32(dea));
+                    if (census_enabled()) census_note(subch, m, vm_read32(dea), CENSUS_2D, 0);
+                }
                 }
             }
             s_fifo_getoff += 4 + count * 4;
@@ -2148,8 +2372,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * overruns first, so the first overrun is recycled by the path above
          * and near-end recycling is enabled from then on. */
         static int s_title_overran = 0;
+        /* Not for a ring whose buffer-full callback is still the runtime's own
+         * sentinel: the title calls it at the end of the ring and
+         * cellGcm_fifo_recycle wraps there safely (JUMP, put = begin, wait for
+         * the drain). Recycling it from this thread as well raced that: ICO
+         * calls the callback correctly, touches `end` for an instant on the
+         * way, and from then on both rewound put/get/current under each other
+         * until one swallowed a frame's label write and user command -- the
+         * title then waited forever for the job they gate (flip ~1000). */
+        const u32 cb_opd_dr = ctx ? vm_read32(ctx + 0xC) : 0;
+        const int runtime_ring_dr = cb_opd_dr &&
+            vm_read32(cb_opd_dr) == GCM_FIFO_CALLBACK_SENTINEL_EA;
         if (begin && end > begin && cur >= end) { head_consumed = 1; s_title_overran = 1; }
-        if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
+        if (!runtime_ring_dr &&
+            begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
                 && head_consumed && s_title_overran) {
             u32 io_begin = gcm_ea2io(begin);
             if (io_begin != 0xFFFFFFFFu) {
@@ -2323,7 +2559,15 @@ u32 cellGcm_display_buffer_count(void)
     return n;
 }
 
+/* counted: whether this flip earns a flip-handler call under GCM_FLIPCB_ONTICK
+ * (see gcm_flip_count_request). */
+static s32 gcm_flip_request_ex(u32 bufferId, int in_fifo, int counted);
 static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+{
+    return gcm_flip_request_ex(bufferId, in_fifo, 1);
+}
+
+static s32 gcm_flip_request_ex(u32 bufferId, int in_fifo, int counted)
 {
     /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
      * which answers "did it ever flip?" and not "is it still flipping, and how
@@ -2375,6 +2619,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     if (!s_display_buffer_set[bufferId])
         return CELL_GCM_ERROR_INVALID_VALUE;
 
+    if (counted) gcm_flip_count_request();
 
     /* in_fifo: the flip sits in the command stream as a GCM_FLIP_MARKER, and
      * the drain does this half when it reaches it (see the 0xFEAD case). */
@@ -2484,8 +2729,22 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     if (!s_display_buffer_set[bufferId])
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId);
+    /* Once per frame for the life of the title: the first few are enough to
+     * see the flip pattern, and the rest held the CRT stdout lock on the
+     * guest's main thread (24% of its samples in ICO). */
+    { static int n = 0;
+      if (n < 16) { n++; printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId); } }
 
+    if (gcm_prepareflip_queue()) {
+#ifdef _WIN32
+        InterlockedOr((volatile LONG*)&s_prepared_flips, (LONG)(1u << bufferId));
+#else
+        __atomic_fetch_or(&s_prepared_flips, 1u << bufferId, __ATOMIC_SEQ_CST);
+#endif
+        return (s32)bufferId;
+    }
+
+    gcm_flip_count_request();
     gcm_set_current_display_buffer(bufferId);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_request_count++;
@@ -3440,8 +3699,28 @@ u32 cellGcmGetDefaultSegmentWordSize(void)
 /* Immediate flip — perform flip right now */
 s32 cellGcmSetFlipImmediate(u32 bufferId)
 {
-    printf("[cellGcmSys] SetFlipImmediate(bufferId=%u)\n", bufferId);
-    return cellGcmSetFlipCommand(bufferId);
+    { static int n = 0;   /* per frame under GCM_PREPAREFLIP_QUEUE */
+      if (n < 16) { n++; printf("[cellGcmSys] SetFlipImmediate(bufferId=%u)\n", bufferId); } }
+    /* Under GCM_FLIPCB_ONTICK an immediate flip earns no flip-handler call.
+     * ICO flips once at init this way, before its first frame, and counts
+     * completed frames in its flip handler; with that flip counted the count
+     * ran one ahead of the frames it submitted, and its frames-in-flight test
+     * (submitted - completed >= 2, unsigned) then held forever. Inferred from
+     * the title's own counters, not from documentation.
+     *
+     * GCM_PREPAREFLIP_QUEUE: a flip PrepareFlip queued is flipped here, and
+     * counts as a requested flip (one flip-handler call when the tick
+     * completes it). An id nothing queued keeps the uncounted path. */
+    if (gcm_prepareflip_queue() && bufferId < 32) {
+        const u32 bit = 1u << bufferId;
+#ifdef _WIN32
+        const u32 was = (u32)InterlockedAnd((volatile LONG*)&s_prepared_flips, (LONG)~bit);
+#else
+        const u32 was = __atomic_fetch_and(&s_prepared_flips, ~bit, __ATOMIC_SEQ_CST);
+#endif
+        if (was & bit) return gcm_flip_request_ex(bufferId, 0, 1);
+    }
+    return gcm_flip_request_ex(bufferId, 0, 0);
 }
 
 /* Set flip status directly */

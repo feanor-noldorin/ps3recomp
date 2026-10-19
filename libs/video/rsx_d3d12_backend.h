@@ -49,6 +49,10 @@ int rsx_d3d12_backend_pump_messages(void);
 /* Force a present (useful for debugging). */
 void rsx_d3d12_backend_present(void);
 
+/* Record an ordered GPU copy of a w x h strip between two offscreen surfaces
+ * (raw RSX offsets + pitches). Returns 0 if the source is not held. */
+int rsx_d3d12_record_rt_copy(u32 src, u32 src_pitch, u32 dst, u32 dst_pitch, u32 w, u32 h);
+
 #ifdef __cplusplus
 }
 #endif
