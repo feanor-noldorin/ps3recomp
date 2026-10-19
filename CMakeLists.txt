@@ -136,6 +136,20 @@ if(WIN32)
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
+    # PS3RECOMP_PAD_SDL2=ON: cellPad also reads controllers through SDL2, which
+    # drives DualSense / DualShock 4 (and a DualShock 3 behind a HID driver)
+    # natively; XInput stays the fallback when SDL2 fails to start. Point
+    # SDL2_DIR at the cmake/ folder of the SDL2 VC development package. The
+    # title's build copies SDL2.dll next to its executable (PS3RECOMP_SDL2_DLL).
+    option(PS3RECOMP_PAD_SDL2 "cellPad: SDL2 controller backend on Windows" OFF)
+    if(PS3RECOMP_PAD_SDL2)
+        find_package(SDL2 CONFIG REQUIRED)
+        set_target_properties(SDL2::SDL2 PROPERTIES IMPORTED_GLOBAL TRUE)
+        target_link_libraries(ps3recomp_runtime PUBLIC SDL2::SDL2)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_PAD_USE_SDL2=1)
+        set(PS3RECOMP_SDL2_DLL "$<TARGET_FILE:SDL2::SDL2>" CACHE INTERNAL "")
+        message(STATUS "  SDL2:         ${SDL2_VERSION} (cellPad controller backend)")
+    endif()
 else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
     # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
