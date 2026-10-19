@@ -145,6 +145,12 @@ static u64            s_audio_start_us = 0;
 
 /* Mixing thread */
 static unsigned long long g_audio_dropped;   /* frames the device had no room for */
+/* AUDIO_RATE diagnostics. guest_empty: a block read back all-zero from a port
+ * that carried sound within the last second -- the consumed-block clear below
+ * means the title's mixer did not refill it in time (a guest underrun).
+ * dev_starved: submits that found the device buffer already empty (the host
+ * mixer fell behind the device). */
+static unsigned long long g_audio_guest_empty, g_audio_dev_starved;
 static volatile int  s_mix_thread_running = 0;
 static thread_t      s_mix_thread;
 #ifndef _WIN32
@@ -367,6 +373,7 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     UINT32 padding = 0;
     s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
 
+    { static int started; if (padding) started = 1; else if (started) g_audio_dev_starved++; }
     UINT32 available = s_wasapi_buf_frames - padding;
     if (num_samples > available) {
         g_audio_dropped += num_samples - available;
@@ -518,6 +525,13 @@ static void audio_mix_one_block(void)
             s_mix_buffer[s * 2 + 1] += right;
         }
 
+        { static u64 last_sound[CELL_AUDIO_PORT_MAX];
+          int nz = 0;
+          for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES * nch; s2 += 8)
+              if (src[s2] != 0.0f) { nz = 1; break; }
+          if (nz) last_sound[p] = port->read_index + 1;
+          else if (last_sound[p] && port->read_index + 1 - last_sound[p] < 188u) g_audio_guest_empty++; }
+
         /* Firmware clears a ring-buffer block after consuming it. Besides
          * preventing stale PCM from replaying when a producer stalls, the
          * cleared block is an observable consumption signal for producers. */
@@ -639,6 +653,11 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
 #else
                         0u, 10);
 #endif
+                { static unsigned long long ge0, ds0;
+                  fprintf(stderr, "[audio-rate] guest empty blocks %.1f/s, device starved %.1f/s%c",
+                          (g_audio_guest_empty - ge0) * 1000.0 / (now - t0),
+                          (g_audio_dev_starved - ds0) * 1000.0 / (now - t0), 10);
+                  ge0 = g_audio_guest_empty; ds0 = g_audio_dev_starved; }
                 n = z = 0; d0 = g_audio_dropped; u0 = g_audio_underruns; t0 = now; } } }
 
         /* Notify event queues */

@@ -7634,6 +7634,10 @@ static rsx_backend s_d3d12_backend = {0};
  * Public API
  * -----------------------------------------------------------------------*/
 
+/* The shared register-file draw engine's D3D12 backend (stage i). */
+#include "rsx_d3d12_engine_impl.h"
+static int s_eng_active;   /* PS3RECOMP_RSX_ENGINE=dispatch brought the engine up */
+
 int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 {
     memset(&s_d3d, 0, sizeof(s_d3d));
@@ -7693,7 +7697,18 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
     s_d3d12_backend.draw_indexed      = d3d12_draw_indexed;
     s_d3d12_backend.bind_texture      = d3d12_bind_texture;
 
-    rsx_set_backend(&s_d3d12_backend);
+    /* One path at a time, as the Vulkan and Metal backends do: the FIFO
+     * walker feeds both the rsx_state recorder and the register-file engine,
+     * so registering both would record every draw twice. The engine is opt-in
+     * here (PS3RECOMP_RSX_ENGINE=dispatch) while its D3D12 backend grows. */
+    rsx_draw_engine_set_backend(&s_d3d12_engine_backend);
+    rsx_draw_engine_set_default(0);
+    if (rsx_draw_engine_enabled() && rsx_draw_engine_init(width, height) == 0) {
+        s_eng_active = 1;
+        printf("[D3D12] register-file draw engine path\n");
+    } else {
+        rsx_set_backend(&s_d3d12_backend);
+    }
 
     s_d3d.initialized = 1;
     s_d3d.last_fps_time = GetTickCount64();
@@ -7705,6 +7720,9 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 void rsx_d3d12_backend_shutdown(void)
 {
     if (!s_d3d.initialized) return;
+
+    if (s_eng_active) { rsx_draw_engine_shutdown(); s_eng_active = 0; }
+    rsx_draw_engine_set_backend(NULL);
 
     wait_for_gpu();
 
@@ -7753,6 +7771,7 @@ int rsx_d3d12_backend_pump_messages(void)
 
 void rsx_d3d12_backend_present(void)
 {
+    if (s_eng_active) { rsx_draw_engine_present(); return; }
     if (blink_dbg())
         printf("[PRESENT] draws=%u clears_since_last=%u clear_presents=%u\n",
                s_d3d.draw_count, s_dbg_clears_since_present, s_clear_presents);

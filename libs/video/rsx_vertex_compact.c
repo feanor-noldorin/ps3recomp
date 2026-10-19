@@ -274,9 +274,16 @@ static int rsx_vertex_fetch_attr_value(
         return 1;
     }
 
-    const u32 element = rsx_vertex_element_index(
-        ref->vertex_id, ref->base_index, fetch->desc.frequency,
-        (plan->divider_mask >> attr) & 1u);
+    /* An INLINE_ARRAY stream is one vertex after another: the frequency
+     * divider is a vertex-array feature and does not apply. A title's stale
+     * divider (ICO leaves 12 on the attribute its full-screen quads carry
+     * their texture coordinates in) would otherwise make every vertex read
+     * element 0 -- one texel smeared over the whole pass. */
+    const u32 element = plan->inline_data
+        ? ref->vertex_id
+        : rsx_vertex_element_index(
+            ref->vertex_id, ref->base_index, fetch->desc.frequency,
+            (plan->divider_mask >> attr) & 1u);
     const u8* source = NULL;
     if (fetch->stable_base &&
         element >= fetch->stable_first && element <= fetch->stable_last) {
@@ -363,7 +370,10 @@ int rsx_vertex_fetch_many(
         const u32 span = fetch->stable_last - first;
         const u32 fstride = fetch->stride;
         const u32 modulo = (plan->divider_mask >> attr) & 1u;
-        const int plain = rsx_vertex_freq_plain(fetch->desc.frequency, modulo);
+        /* Inline vertices are plain whatever the divider says (see
+         * rsx_vertex_fetch_attr_value). */
+        const int plain = plan->inline_data != NULL ||
+                          rsx_vertex_freq_plain(fetch->desc.frequency, modulo);
         const u32 n = fetch->desc.size < 4 ? fetch->desc.size : 4;
         switch (type) {
         case RSX_VTX_TYPE_FLOAT:

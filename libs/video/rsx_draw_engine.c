@@ -67,6 +67,8 @@ extern u32 ppu_vm_size;
 #define M_BLEND_SFACTOR       0x0314
 #define M_BLEND_DFACTOR       0x0318
 #define M_BLEND_EQUATION      0x0320
+#define M_BLEND_COLOR         0x031C
+#define M_BLEND_COLOR2        0x037C
 #define M_COLOR_MASK          0x0324
 #define M_STENCIL_TEST_ENABLE 0x0328
 #define M_STENCIL_MASK        0x032C
@@ -932,6 +934,53 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
                 eng_nonzero_pixels(rows, w * h, 4u));
     g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
+}
+
+static void eng_surfaces_wrote(const u32* targets, u32 n_targets);
+
+/* GPU shadows of main-memory ranges (rsx_draw_engine_shadow_out/_in). */
+#define ENG_MAX_SHADOWS 16
+static struct { u32 main, w, h, handle; } s_shadow[ENG_MAX_SHADOWS];
+
+int rsx_draw_engine_shadow_out(u32 src_offset, u32 src_pitch, u32 main_offset, u32 w, u32 h)
+{
+    if (!g.ready || !g.be->copy_region || !w || !h) return 0;
+    u32 x = 0, y = 0;
+    const u32 slot = eng_surface_at(RSX_LOCATION_LOCAL, src_offset, src_pitch, &x, &y);
+    if (slot == ENG_INVALID) return 0;
+    const eng_surface* s = &g.surfaces[slot];
+    if (x + w > s->w || y + h > s->h) return 0;
+    u32 i = 0;
+    while (i < ENG_MAX_SHADOWS && s_shadow[i].handle && s_shadow[i].main != main_offset) i++;
+    if (i == ENG_MAX_SHADOWS) return 0;
+    if (s_shadow[i].handle && (s_shadow[i].w != w || s_shadow[i].h != h)) {
+        g.be->color_target_release(g.be->user, s_shadow[i].handle);
+        s_shadow[i].handle = 0;
+    }
+    if (!s_shadow[i].handle) {
+        s_shadow[i].handle = g.be->color_target_create(g.be->user, RSX_BE_FMT_R8G8B8A8, w, h, NULL, 0);
+        if (!s_shadow[i].handle) return 0;
+        s_shadow[i].main = main_offset; s_shadow[i].w = w; s_shadow[i].h = h;
+    }
+    g.be->copy_region(g.be->user, s->handle, x, y, s_shadow[i].handle, 0, 0, w, h);
+    return 1;
+}
+
+int rsx_draw_engine_shadow_in(u32 main_offset, u32 dst_offset, u32 dst_pitch, u32 w, u32 h)
+{
+    if (!g.ready || !g.be->copy_region || !w || !h) return 0;
+    u32 i = 0;
+    while (i < ENG_MAX_SHADOWS && !(s_shadow[i].handle && s_shadow[i].main == main_offset &&
+                                    s_shadow[i].w == w && s_shadow[i].h == h)) i++;
+    if (i == ENG_MAX_SHADOWS) return 0;
+    u32 x = 0, y = 0;
+    const u32 slot = eng_surface_at(RSX_LOCATION_LOCAL, dst_offset, dst_pitch, &x, &y);
+    if (slot == ENG_INVALID) return 0;
+    const eng_surface* s = &g.surfaces[slot];
+    if (x + w > s->w || y + h > s->h) return 0;
+    g.be->copy_region(g.be->user, s_shadow[i].handle, 0, 0, s->handle, x, y, w, h);
+    eng_surfaces_wrote(&slot, 1);
+    return 1;
 }
 
 static u32 eng_current_surface(void)
@@ -3193,6 +3242,26 @@ static void sink_end(void* user, const rsx_dispatch* r)
     /* Dynamic, and deliberately outside the pipeline key. */
     g.be->set_stencil_ref(g.be->user,
                           rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
+    /* So is the constant blend colour. An 8-bit target reads BLEND_COLOR as
+     * A8R8G8B8; an FP16 one takes R,G as halves from BLEND_COLOR and B,A
+     * from BLEND_COLOR2. Without it a CONSTANT_COLOR blend (ICO lerps the
+     * previous frame into the new one by 0x3F3F3F3F) ran with whatever
+     * factor the host API defaulted to. */
+    if (g.be->set_blend_color) {
+        const u32 c = rsx_dsp_reg(&g.rsx, M_BLEND_COLOR);
+        float bc[4];
+        if (rs.rt_fp16) {
+            const u32 c2 = rsx_dsp_reg(&g.rsx, M_BLEND_COLOR2);
+            bc[0] = pd_half((u16)(c & 0xFFFFu));  bc[1] = pd_half((u16)(c >> 16));
+            bc[2] = pd_half((u16)(c2 & 0xFFFFu)); bc[3] = pd_half((u16)(c2 >> 16));
+        } else {
+            bc[0] = (float)((c >> 16) & 0xFFu) / 255.0f;
+            bc[1] = (float)((c >>  8) & 0xFFu) / 255.0f;
+            bc[2] = (float)( c        & 0xFFu) / 255.0f;
+            bc[3] = (float)((c >> 24) & 0xFFu) / 255.0f;
+        }
+        g.be->set_blend_color(g.be->user, bc);
+    }
     /* The bounds too: a deferred renderer moves them between its light and
      * sky passes without changing anything else. Raw floats, as written. */
     if (g.be->set_depth_bounds) {
@@ -3268,14 +3337,23 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         /* Every target the set names, not only A: a deferred pass clears its
          * whole G-buffer in one CLEAR_SURFACE, and B, C and D would otherwise
          * keep whatever the last frame left in them. Each only where the
-         * clip and the scissor let the clear through (eng_clear_rect). */
+         * clip and the scissor let the clear through (eng_clear_rect). A
+         * partial mask leaves the other channels as they are: an alpha-only
+         * clear of a target the frame has already drawn into must not erase
+         * its colour (ICO clears its scene target's alpha mid-frame). There
+         * is no masked form limited to a rectangle; the masked clears seen so
+         * far cover the whole target. */
+        const u32 channels = ((mask & RSX_CLEAR_COLOR_R) ? 1u : 0u) | ((mask & RSX_CLEAR_COLOR_G) ? 2u : 0u) |
+                             ((mask & RSX_CLEAR_COLOR_B) ? 4u : 0u) | ((mask & RSX_CLEAR_COLOR_A) ? 8u : 0u);
         int wrote = 0;
         for (u32 i = 0; i < n_targets; i++) {
             const eng_surface* s = &g.surfaces[targets[i]];
             u32 rc[4];
             const int part = eng_clear_rect(&sf, s->w, s->h, rc);
             if (!part) continue;
-            if (part == 2 && g.be->clear_color_rect) {
+            if (channels != 0xFu && g.be->clear_color_masked) {
+                g.be->clear_color_masked(g.be->user, s->handle, rgba, channels);
+            } else if (part == 2 && g.be->clear_color_rect) {
                 eng_log_rect_clear("colour", rc, s->w, s->h);
                 g.be->clear_color_rect(g.be->user, s->handle, rgba,
                                        rc[0], rc[1], rc[2], rc[3]);
