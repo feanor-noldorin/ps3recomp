@@ -25,6 +25,8 @@ float rsx_rd_half_be(const u8* p)
     float o; memcpy(&o, &f, 4); return o;
 }
 
+const rsx_inline_vertex_src* g_rsx_inline_src = NULL;
+
 void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
 {
     /* A disabled attribute array feeds the CONSTANT vertex attribute register
@@ -38,6 +40,17 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
     out[3] = st->vertex_data4f[idx][3];
 
     const rsx_vertex_attrib* a = &st->vertex_attribs[idx];
+    const u8* p;
+    if (g_rsx_inline_src) {
+        /* Inline batch: attributes are packed per vertex in the FIFO data, the
+         * array offsets and the frequency divider do not apply. */
+        const rsx_inline_vertex_src* s = g_rsx_inline_src;
+        if (!a->enabled || !a->type) return;
+        const u32 ioff = vi * s->stride + s->off[idx];
+        if (ioff >= s->bytes) return;
+        p = s->data + ioff;
+        goto decode;
+    }
     if (!a->enabled || a->stride == 0 || !vm_base) return;
 
     /* Vertex frequency divisor (instancing). freq 0/1 = per-vertex. For
@@ -69,10 +82,11 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
      * collapsed to the origin, while non-indexed geometry whose arrays lie
      * outside the shadowed pages drew fine. */
     u32 off = (a->offset & 0x7FFFFFFFu) + ei * a->stride;
-    const u8* p = vm_base + ((a->offset & 0x80000000u)
+    p = vm_base + ((a->offset & 0x80000000u)
         ? cellGcmResolveLocated(0, off)   /* MAIN:  IO offset table          */
         : cellGcmResolveLocated(1, off)); /* LOCAL: VRAM, never the IO table */
 
+decode:;
     u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
     switch (a->type) {
     case 2: /* CELL_GCM_VERTEX_F: float32 BE */
@@ -94,6 +108,15 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
         for (u32 k = 0; k < n; k++)
             out[k] = (float)(s16)((p[k*2] << 8) | p[k*2+1]);
         break;
+    case 6: { /* CMP: one BE word, X 11 bits | Y 11 bits | Z 10 bits, each
+               * signed normalized (X,Y /1023, Z /511), W = 1. Packed normals;
+               * read as a float they were garbage, which lit surfaces wrong. */
+        const u32 v = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+        out[0] = (float)((int32_t)(v << 21) >> 21) / 1023.0f;
+        out[1] = (float)((int32_t)(v << 10) >> 21) / 1023.0f;
+        out[2] = (float)((int32_t)v >> 22) / 511.0f;
+        out[3] = 1.0f;
+        break; }
     case 7: /* UB256: u8 unnormalized */
         for (u32 k = 0; k < n; k++) out[k] = (float)p[k];
         break;

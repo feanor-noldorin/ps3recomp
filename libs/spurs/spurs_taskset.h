@@ -75,18 +75,38 @@ static inline uint32_t spurs_taskset_taskinfo_ea(uint32_t taskset_ea, uint32_t t
 { return taskset_ea + CSTS_TASKINFO + taskId * TI_SIZE; }
 
 /* set/clear/test a task bit in a 128-bit bitset (bit 0 = MSB of word 0, per RPCS3
- * atomic_tasks_bitset::get_bit). bitset_ea = taskset_ea + CSTS_READY etc. */
-static inline void spurs_bitset_set(uint32_t bitset_ea, uint32_t taskId)
+ * atomic_tasks_bitset::get_bit). bitset_ea = taskset_ea + CSTS_READY etc.
+ *
+ * set/clear are a read-modify-write of a word that SPU code also updates, with
+ * GETLLAR/PUTLLC on the same 128-byte line: a task signalling another task sets
+ * the target's bit in CSTS_SIGNALLED that way, while WAIT_SIGNAL clears the
+ * waiter's own bit from here. vm_write32 serializes only the store, so a PUTLLC
+ * landing between the read and the write had its bit written back to zero and
+ * the target task slept through its signal (ICO's five-task frame filter then
+ * stopped at its SPURS barrier with 4 of 5 arrived, a different task missing on
+ * each boot). Do the whole RMW under the lock-line lock PUTLLC commits under,
+ * and report the write so a reserving SPU sees its reservation lost. Callers
+ * must not already hold that lock (it is not recursive). */
+static inline void spurs_bitset_update(uint32_t bitset_ea, uint32_t taskId, int set)
 {
     uint32_t word_ea = bitset_ea + (taskId / 32) * 4;
     uint32_t mask = (1u << 31) >> (taskId % 32);
-    vm_write32(word_ea, vm_read32(word_ea) | mask);
+    uint32_t raw;
+    spu_lockline_lock();
+    memcpy(&raw, vm_ptr8(word_ea), sizeof(raw));
+    raw = ps3_bswap32(set ? (ps3_bswap32(raw) | mask) : (ps3_bswap32(raw) & ~mask));
+    memcpy(vm_ptr8(word_ea), &raw, sizeof(raw));
+    spu_coh_notify_write(word_ea);
+    spu_lockline_unlock();
+    if (g_resv_store_active > 0) ppu_resv_break_store(word_ea);
+}
+static inline void spurs_bitset_set(uint32_t bitset_ea, uint32_t taskId)
+{
+    spurs_bitset_update(bitset_ea, taskId, 1);
 }
 static inline void spurs_bitset_clear(uint32_t bitset_ea, uint32_t taskId)
 {
-    uint32_t word_ea = bitset_ea + (taskId / 32) * 4;
-    uint32_t mask = (1u << 31) >> (taskId % 32);
-    vm_write32(word_ea, vm_read32(word_ea) & ~mask);
+    spurs_bitset_update(bitset_ea, taskId, 0);
 }
 static inline int spurs_bitset_test(uint32_t bitset_ea, uint32_t taskId)
 {

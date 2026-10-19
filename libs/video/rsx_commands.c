@@ -15,6 +15,7 @@
  */
 
 #include "rsx_commands.h"
+#include "rsx_vertex_fetch.h"  /* g_rsx_inline_src (INLINE_ARRAY) */
 #include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
@@ -84,6 +85,14 @@ void rsx_state_init(rsx_state* state)
     state->stencil_op_fail = 0x1E00;  /* KEEP */
     state->stencil_op_zfail = 0x1E00; /* KEEP */
     state->stencil_op_zpass = 0x1E00; /* KEEP */
+    state->stencil_write_mask = 0xFF;
+    state->stencil_two_sided = 0;
+    state->back_stencil_func = 0x0207;
+    state->back_stencil_ref = 0;
+    state->back_stencil_mask = 0xFF;
+    state->back_stencil_write_mask = 0xFF;
+    state->back_stencil_op_fail = state->back_stencil_op_zfail =
+        state->back_stencil_op_zpass = 0x1E00;
 
     /* Default alpha test */
     state->alpha_func = 0x0207; /* ALWAYS */
@@ -333,6 +342,72 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
  * Main method dispatch
  * -----------------------------------------------------------------------*/
 
+/* ---------------------------------------------------------------------------
+ * NV4097_INLINE_ARRAY (0x1818): vertex data pushed through the FIFO itself,
+ * one word per method call between SET_BEGIN_END(prim) and SET_BEGIN_END(0).
+ * Attributes are packed per vertex in attribute order, sized by their FORMAT
+ * (type x size); the stride is the declared one when given. At END the batch
+ * is drawn through the backend's draw_arrays with rsx_fetch_attrib reading
+ * these bytes (g_rsx_inline_src). ICO draws its final composite, the passes
+ * that read the MLAA output and most of its bloom chain this way.
+ * -----------------------------------------------------------------------*/
+#define RSX_INLINE_MAX (1u << 20)
+static u8  s_inline_buf[RSX_INLINE_MAX];
+static u32 s_inline_len;
+
+static u32 rsx_inline_attr_bytes(u32 type, u32 size)
+{
+    switch (type) {
+    case 2: return 4 * size;   /* F     */
+    case 3: return 2 * size;   /* SF    */
+    case 4: return size;       /* UB    */
+    case 1: return 2 * size;   /* S1    */
+    case 5: return 2 * size;   /* S32K  */
+    case 6: return 4;          /* CMP   */
+    case 7: return size;       /* UB256 */
+    default: return 4 * size;
+    }
+}
+
+static void rsx_inline_draw(rsx_state* state)
+{
+    rsx_inline_vertex_src src;
+    u32 packed = 0, declared = 0;
+    memset(&src, 0, sizeof(src));
+    for (u32 i = 0; i < RSX_MAX_VERTEX_ATTRIBS; i++) {
+        const rsx_vertex_attrib* a = &state->vertex_attribs[i];
+        src.off[i] = packed;
+        if (!a->type || !a->size) continue;
+        packed += rsx_inline_attr_bytes(a->type, a->size);
+        if (a->stride > declared) declared = a->stride;
+    }
+    src.stride = declared ? declared : packed;
+    src.data = s_inline_buf;
+    src.bytes = s_inline_len;
+    const u32 count = src.stride ? s_inline_len / src.stride : 0;
+    { static int n = 0;
+      if (n++ < 8) fprintf(stderr, "[RSX] INLINE_ARRAY prim=%u bytes=%u stride=%u verts=%u surf0=0x%X\n",
+                           state->primitive_type, s_inline_len, src.stride, count,
+                           state->surface_color_offset[0]);
+      if (n <= 2) {
+          for (u32 i = 0; i < RSX_MAX_VERTEX_ATTRIBS; i++) {
+              const rsx_vertex_attrib* a = &state->vertex_attribs[i];
+              if (a->type && a->size)
+                  fprintf(stderr, "[RSX]   attr%u type=%u size=%u stride=%u off=%u\n",
+                          i, a->type, a->size, a->stride, src.off[i]);
+          }
+          fprintf(stderr, "[RSX]   vtx0:");
+          for (u32 b = 0; b < src.stride && b < s_inline_len; b += 4)
+              fprintf(stderr, " %02X%02X%02X%02X", s_inline_buf[b], s_inline_buf[b+1],
+                      s_inline_buf[b+2], s_inline_buf[b+3]);
+          fprintf(stderr, "\n");
+      } }
+    if (!count || !s_backend || !s_backend->draw_arrays) return;
+    g_rsx_inline_src = &src;
+    s_backend->draw_arrays(s_backend->userdata, state->primitive_type, 0, count);
+    g_rsx_inline_src = NULL;
+}
+
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
     /* RSX_TRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
@@ -546,6 +621,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->blend_dirty = 1;
         return 0;
     }
+    if (method == NV4097_SET_BLEND_COLOR) {
+        state->blend_color = data;
+        return 0;
+    }
 
     /* Depth */
     if (method == NV4097_SET_DEPTH_TEST_ENABLE) {
@@ -597,6 +676,29 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
     if (method == NV4097_SET_STENCIL_OP_ZPASS) {
         state->stencil_op_zpass = data;
+        state->stencil_dirty = 1;
+        return 0;
+    }
+    /* Write mask and the two-sided (back face) set. Found unparsed by the
+     * RSX_CENSUS of a title that relies on them (ICO's masks and shadow
+     * volumes: REPLACE / DECR_WRAP with two-sided stencil). */
+    if (method >= NV4097_SET_STENCIL_MASK && method <= NV4097_SET_BACK_STENCIL_OP_ZPASS &&
+        method != NV4097_SET_STENCIL_FUNC && method != NV4097_SET_STENCIL_FUNC_REF &&
+        method != NV4097_SET_STENCIL_FUNC_MASK && method != NV4097_SET_STENCIL_OP_FAIL &&
+        method != NV4097_SET_STENCIL_OP_ZFAIL && method != NV4097_SET_STENCIL_OP_ZPASS &&
+        method != NV4097_SET_STENCIL_TEST_ENABLE) {
+        switch (method) {
+        case NV4097_SET_STENCIL_MASK:                  state->stencil_write_mask = data; break;
+        case NV4097_SET_TWO_SIDED_STENCIL_TEST_ENABLE: state->stencil_two_sided = data ? 1 : 0; break;
+        case NV4097_SET_BACK_STENCIL_MASK:             state->back_stencil_write_mask = data; break;
+        case NV4097_SET_BACK_STENCIL_FUNC:             state->back_stencil_func = data; break;
+        case NV4097_SET_BACK_STENCIL_FUNC_REF:         state->back_stencil_ref = data; break;
+        case NV4097_SET_BACK_STENCIL_FUNC_MASK:        state->back_stencil_mask = data; break;
+        case NV4097_SET_BACK_STENCIL_OP_FAIL:          state->back_stencil_op_fail = data; break;
+        case NV4097_SET_BACK_STENCIL_OP_ZFAIL:         state->back_stencil_op_zfail = data; break;
+        case NV4097_SET_BACK_STENCIL_OP_ZPASS:         state->back_stencil_op_zpass = data; break;
+        default: return -1;
+        }
         state->stencil_dirty = 1;
         return 0;
     }
@@ -745,9 +847,20 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
+    if (method == 0x1818) {   /* NV4097_INLINE_ARRAY: one data word per call */
+        if (state->in_begin_end && s_inline_len + 4 <= RSX_INLINE_MAX) {
+            s_inline_buf[s_inline_len++] = (u8)(data >> 24);
+            s_inline_buf[s_inline_len++] = (u8)(data >> 16);
+            s_inline_buf[s_inline_len++] = (u8)(data >> 8);
+            s_inline_buf[s_inline_len++] = (u8)data;
+        }
+        return 0;
+    }
+
     /* Draw */
     if (method == NV4097_SET_BEGIN_END) {
         if (data != 0) {
+            s_inline_len = 0;
             state->primitive_type = data;
             state->in_begin_end = 1;
             state->begin_epoch++;
@@ -793,6 +906,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
                 state->texture_dirty = 0;
             }
         } else {
+            if (s_inline_len) { rsx_inline_draw(state); s_inline_len = 0; }
             state->in_begin_end = 0;
         }
         return 0;

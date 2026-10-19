@@ -244,6 +244,30 @@ typedef struct rsx_draw_backend {
                               u32 depth, u32 mips, u32 remap, u32 rsx_fmt);
     void (*texture_upload_3d)(void* user, u32 texture, u32 z, u32 mip,
                               u32 w, u32 h, const void* src, u32 row_bytes);
+    /* Optional: clear only the colour channels `channels` names (bit 0 R,
+     * 1 G, 2 B, 3 A) -- CLEAR_SURFACE with a partial colour mask, such as an
+     * alpha-only clear of a target the frame has already drawn into. NULL
+     * keeps the old behaviour, a full clear_color. */
+    void (*clear_color_masked)(void* user, u32 surface, const float rgba[4], u32 channels);
+    /* Optional: the constant colour the CONSTANT_COLOR / CONSTANT_ALPHA blend
+     * factors read (SET_BLEND_COLOR, plus BLEND_COLOR2 on an FP16 target),
+     * R,G,B,A in [0, 1]. Called before every draw, like the stencil
+     * reference: dynamic state, outside the pipeline key. NULL leaves the
+     * backend's own default factor. */
+    void (*set_blend_color)(void* user, const float rgba[4]);
+    /* Optional: a Z24S8 depth target read through a unit as A8R8G8B8, built on
+     * the GPU. Write the top-left w x h of `depth` as the bytes guest memory
+     * would hold (A = depth[23:16], R = [15:8], G = [7:0], B = stencil 0) into
+     * a texture viewed through the unit's crossbar, and return its handle --
+     * owned by the backend and refilled in place on every call -- or 0. Left
+     * NULL, the engine stores the depth into guest memory (depth_readback)
+     * and uploads it back, a CPU round trip per frame. */
+    u32  (*depth_as_color)(void* user, u32 depth, u32 w, u32 h, u32 remap, u32 rsx_fmt);
+    /* Optional: copy a w x h rectangle between two colour targets of the same
+     * format, ordered after the preceding work. Used for GPU shadows of a
+     * surface bounced through main memory (rsx_draw_engine_shadow_out/_in). */
+    void (*copy_region)(void* user, u32 src_surface, u32 sx, u32 sy,
+                        u32 dst_surface, u32 dx, u32 dy, u32 w, u32 h);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -306,6 +330,14 @@ void rsx_draw_engine_note_flip(u32 buffer_id);
  * out with the same pitch take part; anything else is left alone. */
 void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
 void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
+/* A 1:1 transfer that bounces a surface through main memory (local -> main,
+ * work the host skips, then main -> local) kept on the GPU: _out copies the
+ * source rectangle into a GPU shadow keyed by the main-memory offset -- a
+ * snapshot, as the guest memory would hold it -- and _in copies that shadow
+ * into the destination surface. Each returns 1 when it did the copy and the
+ * caller may skip the guest-memory one, 0 to fall back. Needs copy_region. */
+int  rsx_draw_engine_shadow_out(u32 src_offset, u32 src_pitch, u32 main_offset, u32 w, u32 h);
+int  rsx_draw_engine_shadow_in(u32 main_offset, u32 dst_offset, u32 dst_pitch, u32 w, u32 h);
 
 /* --- test hooks ---------------------------------------------------------- */
 

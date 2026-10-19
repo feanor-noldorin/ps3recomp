@@ -894,6 +894,38 @@ emit:
             else                        s_data_fresh[port_no] = 0;
         }
     }
+    /* PAD_DBG=1: every ~2 s, what GetData handed out -- calls per port, how
+     * many reported len = 0 (no new packet), how many carried a button or an
+     * off-centre stick, and the last digital/analog words. Answers "does the
+     * title see the input, and on which port" without guessing. */
+    { static int dbg = -1;
+      if (dbg < 0) dbg = getenv("PAD_DBG") ? 1 : 0;
+      if (dbg && port_no < PAD_MAX_HOST_PORTS) {
+          static unsigned long long calls[PAD_MAX_HOST_PORTS], zero[PAD_MAX_HOST_PORTS], act[PAD_MAX_HOST_PORTS];
+          static unsigned long long t0;
+          const unsigned long long now = GetTickCount64();
+          if (!t0) t0 = now;
+          calls[port_no]++;
+          if (!data->len) zero[port_no]++;
+          if (data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] || data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] ||
+              data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X] != 128 ||
+              data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y] != 128) act[port_no]++;
+          if (now - t0 >= 2000) {
+              t0 = now;
+              for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
+                  if (!calls[p]) continue;
+                  fprintf(stderr, "[PAD_DBG] port %d: GetData %llu calls, len=0 %llu, with input %llu | "
+                          "last d1=%02X d2=%02X lx=%u ly=%u rx=%u ry=%u len=%d%c", p, calls[p], zero[p], act[p],
+                          (unsigned)data->button[CELL_PAD_BTN_OFFSET_DIGITAL1],
+                          (unsigned)data->button[CELL_PAD_BTN_OFFSET_DIGITAL2],
+                          (unsigned)data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X],
+                          (unsigned)data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y],
+                          (unsigned)data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X],
+                          (unsigned)data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y], (int)data->len, 10);
+                  calls[p] = zero[p] = act[p] = 0;
+              }
+          }
+      } }
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
