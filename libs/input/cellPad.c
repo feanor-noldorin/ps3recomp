@@ -447,6 +447,14 @@ static void pad_shutdown_backend(void)
  * SDL2 backend
  * -----------------------------------------------------------------------*/
 
+/* PAD_DBG=1 (see cellPadGetData): also report rumble requests. */
+static int pad_dbg_on(void)
+{
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("PAD_DBG") ? 1 : 0;
+    return dbg;
+}
+
 #if PAD_BACKEND_SDL2
 
 /* PAD_SQUIRCLE[=<factor>]: push a stick's round range out toward a square.
@@ -510,7 +518,13 @@ static void pad_sdl_rumble_send(int i)
     if (!gc) return;
     PadRumble* r = &s_rumble[i];
     const int on = r->lo || r->hi;
-    SDL_GameControllerRumble(gc, r->lo, r->hi, on ? PAD_RUMBLE_HOLD_MS : 0);
+    const int rc = SDL_GameControllerRumble(gc, r->lo, r->hi, on ? PAD_RUMBLE_HOLD_MS : 0);
+    if (rc != 0 && pad_dbg_on()) {
+        static int said = 0;
+        if (said < 8) { said++;
+            fprintf(stderr, "[PAD_DBG] port %d: SDL rumble lo=%u hi=%u failed: %s\n",
+                    i, r->lo, r->hi, SDL_GetError()); }
+    }
     r->sent_ms = on ? pad_now_ms() : 0;
 }
 
@@ -1497,6 +1511,28 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
                       param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE], &lo, &hi);
     s_rumble[port_no].lo = lo;
     s_rumble[port_no].hi = hi;
+
+    /* PAD_DBG=1: every change of the requested motor levels (the first 200),
+     * with the call count -- answers "did the title ask for vibration at all,
+     * and when". A title re-sends the same levels every frame; only changes
+     * are logged. */
+    if (pad_dbg_on()) {
+        static unsigned long long calls = 0;
+        static int last_small = -1, last_large = -1, lines = 0;
+        const int sm = param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL];
+        const int lg = param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE];
+        calls++;
+        if ((sm != last_small || lg != last_large) && lines < 200) {
+            lines++;
+            fprintf(stderr, "[PAD_DBG] port %u: SetActDirect small=%d large=%d -> lo=%u hi=%u "
+                            "(call %llu, host %s)\n", port_no, sm, lg, lo, hi, calls,
+#if PAD_BACKEND_SDL2
+                    s_sdl_controllers[port_no] ? "SDL2" :
+#endif
+                    (s_host_state[port_no].connected ? "XInput" : "none"));
+        }
+        last_small = sm; last_large = lg;
+    }
 
 #if PAD_BACKEND_XINPUT
     /* XInput keeps the motors at what they were last set to: no renewal. */
