@@ -54,6 +54,33 @@
 
 enum { DE_NONE = 0, DE_TEXTURE, DE_COLOR, DE_DEPTH, DE_VIEW };
 
+/* RSX comparison functions (0x200 NEVER .. 0x207 ALWAYS) and stencil ops
+ * (GL enums) as D3D12 values. */
+static u32 gl_func_idx(u32 f) { return (f >= 0x200u && f <= 0x207u) ? f - 0x200u : 7u; }
+static D3D12_COMPARISON_FUNC zfunc_d3d(u32 fi)
+{
+    static const D3D12_COMPARISON_FUNC m[8] = {
+        D3D12_COMPARISON_FUNC_NEVER, D3D12_COMPARISON_FUNC_LESS, D3D12_COMPARISON_FUNC_EQUAL,
+        D3D12_COMPARISON_FUNC_LESS_EQUAL, D3D12_COMPARISON_FUNC_GREATER,
+        D3D12_COMPARISON_FUNC_NOT_EQUAL, D3D12_COMPARISON_FUNC_GREATER_EQUAL,
+        D3D12_COMPARISON_FUNC_ALWAYS };
+    return m[fi & 7u];
+}
+/* Index from 0, so D3D12_STENCIL_OP = index + 1. */
+static u32 gl_stencil_op_idx(u32 op)
+{
+    switch (op & 0xFFFFu) {
+    case 0x0000: return D3D12_STENCIL_OP_ZERO     - 1;
+    case 0x1E01: return D3D12_STENCIL_OP_REPLACE  - 1;
+    case 0x1E02: return D3D12_STENCIL_OP_INCR_SAT - 1;
+    case 0x1E03: return D3D12_STENCIL_OP_DECR_SAT - 1;
+    case 0x150A: return D3D12_STENCIL_OP_INVERT   - 1;
+    case 0x8507: return D3D12_STENCIL_OP_INCR     - 1;
+    case 0x8508: return D3D12_STENCIL_OP_DECR     - 1;
+    default:     return D3D12_STENCIL_OP_KEEP     - 1;   /* 0x1E00 KEEP */
+    }
+}
+
 typedef struct {
     int                   kind;
     ID3D12Resource*       res;       /* NULL for a view (uses the parent's) */
