@@ -332,9 +332,16 @@ static SPU_TLS LONG         t_mfc_gen = -1;
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
-    { static volatile LONG started = 0; const char* e;
-      if (!started && (e = getenv("SPU_PCSAMPLE")) && !InterlockedExchange(&started, 1))
-          CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL); }
+    /* Read SPU_PCSAMPLE once. Testing it on every call kept getenv -- which
+     * takes the CRT environment lock -- on every MFC channel access while the
+     * variable is unset: ICO's two polling SPU threads spent ~95% of their
+     * samples there and the intro ran at half speed. */
+    { static volatile LONG checked = 0;
+      if (!checked && !InterlockedExchange(&checked, 1)) {
+          const char* e = getenv("SPU_PCSAMPLE");
+          if (e && atoi(e) > 0)
+              CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL);
+      } }
     static int s_tls = -1;  /* SPU_MFC_TLS=0: always take the registry lock (bisect switch) */
     if (s_tls < 0) { const char* e = getenv("SPU_MFC_TLS"); s_tls = e ? atoi(e) : 1; }
     if (s_tls && t_mfc_ctx == ctx && t_mfc_gen == s_mfc_gen) return t_mfc_eng;
