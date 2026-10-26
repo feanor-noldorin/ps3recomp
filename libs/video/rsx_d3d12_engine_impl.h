@@ -93,7 +93,14 @@ typedef struct {
     u32                   conv;      /* DE_DEPTH: depth_as_color target     */
     int                   dsrv;      /* DE_DEPTH: R24_UNORM_X8 SRV, -1 none  */
     int                   ssrv;      /* DE_DEPTH: X24_G8_UINT stencil SRV    */
+    int                   dac;       /* DE_COLOR made by depth_as_color: recycled */
 } de_obj;
+
+/* depth_as_color targets the engine has released, kept for reuse (see
+ * de_depth_as_color). */
+#define DE_DAC_POOL 8
+static u32 s_dac_pool[DE_DAC_POOL];
+static u32 s_n_dac_pool;
 
 typedef struct {
     int                   used;
@@ -584,6 +591,7 @@ static void de_shutdown(void* user)
     if (s_de.fence)    s_de.fence->lpVtbl->Release(s_de.fence);
     if (s_de.event)    CloseHandle(s_de.event);
     memset(&s_de, 0, sizeof s_de);
+    s_n_dac_pool = 0;
 }
 
 static void de_submit_and_wait(void* user, u32 reason) { (void)user; (void)reason; de_submit(); }
@@ -623,7 +631,16 @@ static void de_texture_upload(void* user, u32 texture, u32 face, u32 mip, u32 w,
     de_upload_sub(o, mip + face * o->mips, src, row_bytes, rows);
 }
 
-static void de_release(void* user, u32 handle) { (void)user; de_release_obj(handle); }
+static void de_release(void* user, u32 handle)
+{
+    (void)user;
+    /* A depth_as_color target goes back to the pool instead: the engine
+     * releases the previous one every time the depth changes, i.e. every
+     * frame, and a real release waits for the GPU (de_release_obj submits). */
+    const de_obj* o = de_get(handle, DE_COLOR);
+    if (o && o->dac && s_n_dac_pool < DE_DAC_POOL) { s_dac_pool[s_n_dac_pool++] = handle; return; }
+    de_release_obj(handle);
+}
 
 /* ---- targets ------------------------------------------------------------ */
 
@@ -808,7 +825,23 @@ static u32 de_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt)
         s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, z->res, &sd,
             de_cpu(s_de.srv_cpu, s_de.srv_inc, (u32)z->dsrv));
     }
-    const u32 out = de_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, w, h, NULL, 0);
+    /* Reuse a released target of this size: creating and destroying one per
+     * frame cost a GPU wait per frame (de_release_obj submits). The queue
+     * runs in order, so drawing into it again after last frame's reads, with
+     * the transition below, is safe. */
+    u32 out = 0;
+    for (u32 i = 0; i < s_n_dac_pool; i++) {
+        const de_obj* q = de_get(s_dac_pool[i], DE_COLOR);
+        if (q && q->w == w && q->h == h) {
+            out = s_dac_pool[i];
+            s_dac_pool[i] = s_dac_pool[--s_n_dac_pool];
+            break;
+        }
+    }
+    if (!out) {
+        out = de_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, w, h, NULL, 0);
+        if (out) s_de.obj[out].dac = 1;
+    }
     de_obj* c = de_get(out, DE_COLOR);
     if (!c) return 0;
     z = de_get(depth, DE_DEPTH);   /* the table does not move, but stay safe */
