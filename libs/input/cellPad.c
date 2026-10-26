@@ -61,6 +61,13 @@ static double pad_clock(unsigned long long t0_ms)
   #include <xinput.h>
 #endif
 
+#if defined(_WIN32) && !PAD_BACKEND_XINPUT
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <windows.h>   /* the keyboard fallback */
+#endif
+
 #if PAD_BACKEND_SDL2
   #define SDL_MAIN_HANDLED   /* the title's main() stays its own */
   #if defined(__has_include)
@@ -276,78 +283,6 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
  * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
  * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
  * so a title that reads the stick instead is playable too. */
-#ifdef _WIN32
-static int pad_host_window_focused(void)
-{
-    HWND fg = GetForegroundWindow();
-    if (!fg) return 0;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(fg, &pid);
-    return pid == GetCurrentProcessId();
-}
-
-/* merge = a controller already filled port 0 on this sweep: the keys are
- * added to it (buttons OR'd, the left stick taken from the arrows only while
- * one is held) instead of replacing it, so keyboard and pad work together. */
-static void pad_poll_keyboard(int merge)
-{
-    static int off = -1;
-    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
-    if (off) return;
-
-    PadHostState* hs = &s_host_state[0];
-    if (!pad_host_window_focused()) {
-        if (merge) return;   /* the controller's own state stands */
-        /* Release everything on focus loss, or a key held while alt-tabbing
-         * would stay down forever. */
-        hs->buttons = 0;
-        hs->analog_lx = hs->analog_ly = 128;
-        hs->analog_rx = hs->analog_ry = 128;
-        hs->connected = 1;
-        return;
-    }
-
-    static const struct { int vk; u16 btn; } map[] = {
-        { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
-        { VK_LEFT,   CELL_PAD_CTRL_LEFT },    { VK_RIGHT, CELL_PAD_CTRL_RIGHT },
-        { 'Z',       CELL_PAD_CTRL_CROSS },   { 'X',      CELL_PAD_CTRL_CIRCLE },
-        { 'A',       CELL_PAD_CTRL_SQUARE },  { 'S',      CELL_PAD_CTRL_TRIANGLE },
-        { 'Q',       CELL_PAD_CTRL_L1 },      { 'W',      CELL_PAD_CTRL_R1 },
-        { '1',       CELL_PAD_CTRL_L2 },      { '2',      CELL_PAD_CTRL_R2 },
-        { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
-    };
-
-    u16 btns = 0;
-    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
-        if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
-
-    if (merge) {
-        hs->buttons |= btns;
-        if (btns & CELL_PAD_CTRL_LEFT)  hs->analog_lx = 0;
-        if (btns & CELL_PAD_CTRL_RIGHT) hs->analog_lx = 255;
-        if (btns & CELL_PAD_CTRL_UP)    hs->analog_ly = 0;
-        if (btns & CELL_PAD_CTRL_DOWN)  hs->analog_ly = 255;
-        if (btns & CELL_PAD_CTRL_L2)    hs->trigger_l2 = 255;
-        if (btns & CELL_PAD_CTRL_R2)    hs->trigger_r2 = 255;
-        return;
-    }
-
-    hs->buttons   = btns;
-    hs->connected = 1;
-    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
-                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
-    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
-                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
-    hs->analog_rx = hs->analog_ry = 128;
-    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
-    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
-
-    { static int said = 0;
-      if (!said && btns) { said = 1;
-          printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
-          fflush(stdout); } }
-}
-#endif
 
 /* XInputGetState on a slot with nothing plugged in costs about 140 us (2 us on
  * a connected one), and the backend is polled at least once a frame: three
@@ -442,6 +377,81 @@ static void pad_shutdown_backend(void)
 }
 
 #endif /* PAD_BACKEND_XINPUT */
+
+/* The keyboard fallback (port 0) is Win32, not XInput: it is there with
+ * either controller backend on Windows. */
+#ifdef _WIN32
+static int pad_host_window_focused(void)
+{
+    HWND fg = GetForegroundWindow();
+    if (!fg) return 0;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+/* merge = a controller already filled port 0 on this sweep: the keys are
+ * added to it (buttons OR'd, the left stick taken from the arrows only while
+ * one is held) instead of replacing it, so keyboard and pad work together. */
+static void pad_poll_keyboard(int merge)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+    if (off) return;
+
+    PadHostState* hs = &s_host_state[0];
+    if (!pad_host_window_focused()) {
+        if (merge) return;   /* the controller's own state stands */
+        /* Release everything on focus loss, or a key held while alt-tabbing
+         * would stay down forever. */
+        hs->buttons = 0;
+        hs->analog_lx = hs->analog_ly = 128;
+        hs->analog_rx = hs->analog_ry = 128;
+        hs->connected = 1;
+        return;
+    }
+
+    static const struct { int vk; u16 btn; } map[] = {
+        { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
+        { VK_LEFT,   CELL_PAD_CTRL_LEFT },    { VK_RIGHT, CELL_PAD_CTRL_RIGHT },
+        { 'Z',       CELL_PAD_CTRL_CROSS },   { 'X',      CELL_PAD_CTRL_CIRCLE },
+        { 'A',       CELL_PAD_CTRL_SQUARE },  { 'S',      CELL_PAD_CTRL_TRIANGLE },
+        { 'Q',       CELL_PAD_CTRL_L1 },      { 'W',      CELL_PAD_CTRL_R1 },
+        { '1',       CELL_PAD_CTRL_L2 },      { '2',      CELL_PAD_CTRL_R2 },
+        { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
+    };
+
+    u16 btns = 0;
+    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+        if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
+
+    if (merge) {
+        hs->buttons |= btns;
+        if (btns & CELL_PAD_CTRL_LEFT)  hs->analog_lx = 0;
+        if (btns & CELL_PAD_CTRL_RIGHT) hs->analog_lx = 255;
+        if (btns & CELL_PAD_CTRL_UP)    hs->analog_ly = 0;
+        if (btns & CELL_PAD_CTRL_DOWN)  hs->analog_ly = 255;
+        if (btns & CELL_PAD_CTRL_L2)    hs->trigger_l2 = 255;
+        if (btns & CELL_PAD_CTRL_R2)    hs->trigger_r2 = 255;
+        return;
+    }
+
+    hs->buttons   = btns;
+    hs->connected = 1;
+    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
+                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
+    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
+                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
+    hs->analog_rx = hs->analog_ry = 128;
+    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
+    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
+
+    { static int said = 0;
+      if (!said && btns) { said = 1;
+          printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
+          fflush(stdout); } }
+}
+#endif
 
 /* ---------------------------------------------------------------------------
  * SDL2 backend
