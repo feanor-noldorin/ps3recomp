@@ -286,7 +286,15 @@ static volatile u32 s_prepared_flips = 0;   /* bit n: buffer n queued */
 /* Prepare markers the walker has passed, and queued flips executed. The
  * walker passes a marker only while every earlier one has been flipped. */
 static volatile long s_prep_passed = 0, s_prep_flipped = 0;
-static u64 s_prep_hold_since = 0;   /* when the current hold began, 0 = none */
+static volatile u64 s_prep_hold_since = 0;   /* when the current hold began, 0 = none */
+/* Called (on the guest thread) when a flip releases a prepare marker the walker
+ * is holding at. A host that drains the FIFO from its own frame loop sleeps
+ * between turns; without a wake the walker resumes only at the next turn, and
+ * once the walker is quick enough to reach the next marker before the flip
+ * (v0.18), that sleep lands in every frame. ICO: the hold was released ~5 ms
+ * before the 4 ms-sleeping frame loop noticed, frames missed their vblank and
+ * gameplay fell from 60 to ~40 fps. NULL: nobody to wake. */
+void (*g_gcm_prepare_release_hook)(void) = NULL;
 
 /* GCM_FLIP_TRACE=1: one line per flip-pipeline event, ms since the first --
  * P prepare (queued id), I immediate flip of a queued id, C a tick completing
@@ -4567,6 +4575,7 @@ s32 cellGcmSetFlipImmediate(u32 bufferId)
         if (was & bit) {
             gcm_flip_trace('I', bufferId);
             if (s_prep_flipped < s_prep_passed) __atomic_add_fetch(&s_prep_flipped, 1, __ATOMIC_SEQ_CST);
+            if (s_prep_hold_since && g_gcm_prepare_release_hook) g_gcm_prepare_release_hook();
             const s32 rc = gcm_flip_request_ex(bufferId, 0, 1);
             /* The flip happens at this vblank -- the title calls this from
              * its vblank handler -- so complete it now instead of on the
